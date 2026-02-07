@@ -198,6 +198,11 @@ namespace OSK
         private string _indicatorColor = "White";
         public string IndicatorColor { get { return _indicatorColor; } set { _indicatorColor = value; OnPropertyChanged("IndicatorColor"); } }
 
+        // Mode 鍵長按處理相關
+        // 修改：直接初始化以避免 CS8618 警告 (建構子可能因 Mutex 檢查提前返回)
+        private DispatcherTimer _modeKeyTimer = new DispatcherTimer();
+        private bool _modeKeyLongPressHandled = false;
+
         // Fn 模式對照表
         private static readonly Dictionary<byte, string?> FnDisplayMap = new()
         {
@@ -271,10 +276,10 @@ namespace OSK
 
         public MainWindow()
         {
-            _msgShowOsk = RegisterWindowMessage("WM_SHOW_OSK_V100");
+            _msgShowOsk = RegisterWindowMessage("WM_SHOW_OSK");
 
             bool createdNew;
-            _mutex = new Mutex(true, "Global\\OSK_Unique_Mutex_ID_100", out createdNew);
+            _mutex = new Mutex(true, "Global\\OSK_Unique_Mutex", out createdNew);
 
             if (!createdNew)
             {
@@ -285,6 +290,14 @@ namespace OSK
 
             InitializeComponent();
             this.DataContext = this;
+
+            // 初始化 Mode 鍵長按計時器 (已在宣告時建立實體，此處僅設定屬性)
+            _modeKeyTimer.Interval = TimeSpan.FromSeconds(0.2); // 設定秒數
+            _modeKeyTimer.Tick += ModeKeyTimer_Tick;
+
+            // 在代碼中加入事件處理常式，這樣不需要修改 XAML 即可攔截按鈕的按下與放開
+            this.AddHandler(UIElement.PreviewMouseLeftButtonDownEvent, new MouseButtonEventHandler(OnGlobalPreviewMouseDown), true);
+            this.AddHandler(UIElement.PreviewMouseLeftButtonUpEvent, new MouseButtonEventHandler(OnGlobalPreviewMouseUp), true);
 
             this.WindowStartupLocation = WindowStartupLocation.Manual;
             this.Loaded += MainWindow_Loaded;
@@ -305,7 +318,7 @@ namespace OSK
 
             KeyBoardItemsControl.ItemsSource = KeyRows;
 
-            _msgShowOsk = RegisterWindowMessage("WM_SHOW_OSK_V100");
+            _msgShowOsk = RegisterWindowMessage("WM_SHOW_OSK");
 
             System.Drawing.Icon? trayIcon = null;
 
@@ -343,7 +356,7 @@ namespace OSK
             }
 
             // 初始化 NotifyIcon
-            _notifyIcon = new System.Windows.Forms.NotifyIcon { Icon = trayIcon, Visible = true, Text = "OSK v1.0.0" };
+            _notifyIcon = new System.Windows.Forms.NotifyIcon { Icon = trayIcon, Visible = true, Text = "OSK" };
             _notifyIcon.Click += (s, e) => ToggleVisibility();
             var menu = new System.Windows.Forms.ContextMenuStrip();
             menu.Items.Add("結束", null, (s, e) => System.Windows.Application.Current.Shutdown());
@@ -356,6 +369,50 @@ namespace OSK
             timer.Tick += (s, e) => SyncStates();
             timer.Start();
         }
+
+        #region Mode 鍵長按處理邏輯
+
+        private void OnGlobalPreviewMouseDown(object sender, MouseButtonEventArgs e)
+        {
+            // 檢查事件來源的 DataContext 是否為 KeyModel
+            if ((e.OriginalSource as FrameworkElement)?.DataContext is KeyModel key)
+            {
+                if (key.VkCode == MODE_KEY_CODE)
+                {
+                    // 重置狀態並啟動計時器
+                    _modeKeyLongPressHandled = false;
+                    _modeKeyTimer.Start();
+                }
+            }
+        }
+
+        private void OnGlobalPreviewMouseUp(object sender, MouseButtonEventArgs e)
+        {
+            // 無論哪個鍵放開，都停止計時器以防萬一
+            _modeKeyTimer.Stop();
+        }
+
+        private void ModeKeyTimer_Tick(object? sender, EventArgs e)
+        {
+            // 長按時間到（1秒）：立刻切換版面，不等待放開
+            _modeKeyTimer.Stop();
+            _modeKeyLongPressHandled = true; // 標記為已處理，避免放開時觸發短按邏輯
+
+            // 執行「僅切換版面，不切換輸入法」的邏輯
+            _isZhuyinMode = !_isZhuyinMode;
+            
+            // 重置其他相關狀態
+            _localPreviewToggle = false;
+            _temporaryEnglishMode = false;
+            _temporaryEnglishFirstUpperSent = false;
+            _temporaryShiftInjected = false;
+            _virtualShiftToggle = false;
+
+            // 更新 UI 顯示
+            UpdateDisplay();
+        }
+
+        #endregion
 
         private void MainWindow_Loaded(object? sender, RoutedEventArgs e)
         {
@@ -540,6 +597,15 @@ namespace OSK
 
             if (key.VkCode == MODE_KEY_CODE)
             {
+                // 如果長按事件已經處理過（已經在計時器 Tick 中切換了版面），
+                // 則這裡（放開/Click 事件）直接返回，不再執行短按邏輯。
+                if (_modeKeyLongPressHandled)
+                {
+                    _modeKeyLongPressHandled = false;
+                    return;
+                }
+
+                // 以下為短按邏輯：切換版面並發送 Shift
                 if (_virtualFnToggle)
                 {
                     _localPreviewToggle = !_localPreviewToggle;
