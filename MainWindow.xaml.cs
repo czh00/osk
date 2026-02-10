@@ -18,20 +18,15 @@ namespace OSK
 {
     /// <summary>
     /// 主視窗：一個可停靠、非啟動激活的虛擬鍵盤 (WPF)。
-    /// 功能總覽：
-    /// - 顯示虛擬按鍵、處理按鍵點擊並注入虛擬按鍵事件 (改用 SendInput)。
-    /// - 使用全域鍵盤掛鉤 (WH_KEYBOARD_LL) 追蹤實體鍵盤狀態以同步按鍵按下/放開視覺效果。
-    /// - 偵測前景視窗的 IME 狀態 (使用 IMM32 API) 以決定是否顯示注音或英文字母。
-    /// - 支援「Mode」鍵以切換小狼毫/注音狀態（會傳送 Shift 以觸發系統 IME 切換），並支援本地預覽模式避免變更系統 IME。
-    /// - 支援「臨時英文模式」：在注音狀態按 Shift 啟動，第一個字母以大寫送出，後續字母以小寫送出，Enter 結束該臨時模式。
-    /// - 支援虛擬 modifier 鍵 (Shift/Ctrl/Alt/Win) 與 Fn 模式（Fn 可改變鍵盤顯示與發送行為）。
-    /// 注意事項：
-    /// - 本類大量使用 Win32 API 與 IME API，僅在 Windows 平台有效。
-    /// - 由於使用低階鍵盤掛鉤與注入按鍵，需注意不要與系統或其他輸入攔截器產生衝突。
+    /// 修改說明：
+    /// - 修正 OnKeyClick 邏輯：確保 Shift+任意鍵能正確送出大寫字母。
+    /// - 使用 GetAsyncKeyState 與 Timer 輪詢同步實體鍵盤。
+    /// - 使用批次 SendInput 優化按鍵發送穩定性。
     /// </summary>
     public partial class MainWindow : Window, INotifyPropertyChanged
     {
         #region Win32 / IMM API 宣告
+
         [DllImport("user32.dll")] private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
         [DllImport("user32.dll")] private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
 
@@ -90,21 +85,17 @@ namespace OSK
 
         [DllImport("user32.dll")] private static extern uint RegisterWindowMessage(string lpString);
         [DllImport("user32.dll")] private static extern short GetKeyState(int nVirtKey);
+        [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vKey);
         [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
-        // 用於替代 SAS 選單的系統操作
+        // 系統操作 API
         [DllImport("user32.dll", SetLastError = true)] private static extern bool LockWorkStation();
         [DllImport("user32.dll", SetLastError = true)] private static extern bool ExitWindowsEx(uint uFlags, uint dwReason);
         [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hWnd);
-
-        /// <summary>
-        /// 取得執行緒 GUI 狀態，能讓我們找到實際擁有輸入焦點的控制項 hwnd。
-        /// </summary>
         [DllImport("user32.dll")] private static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO lpgui);
 
-        // 用於廣播訊息給所有視窗（尋找已啟動的執行實體）
         private const int HWND_BROADCAST = 0xFFFF;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -121,16 +112,6 @@ namespace OSK
             public System.Drawing.Rectangle rcCaret;
         }
 
-        [StructLayout(LayoutKind.Sequential)]
-        private struct KBDLLHOOKSTRUCT
-        {
-            public uint vkCode;
-            public uint scanCode;
-            public uint flags;
-            public uint time;
-            public UIntPtr dwExtraInfo;
-        }
-
         // IMM32 API
         [DllImport("imm32.dll")] private static extern IntPtr ImmGetContext(IntPtr hWnd);
         [DllImport("imm32.dll")] private static extern bool ImmGetConversionStatus(IntPtr hIMC, out uint lpdwConversion, out uint lpdwSentence);
@@ -138,43 +119,32 @@ namespace OSK
         [DllImport("imm32.dll")] private static extern IntPtr ImmGetDefaultIMEWnd(IntPtr hWnd);
         [DllImport("imm32.dll")] private static extern bool ImmSetConversionStatus(IntPtr hIMC, uint dwConversion, uint dwSentence);
 
-        // 低階鍵盤掛鉤相關
-        [DllImport("user32.dll")] private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
-        [DllImport("user32.dll")] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-        [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-        [DllImport("kernel32.dll")] private static extern IntPtr GetModuleHandle(string lpModuleName);
         #endregion
 
         #region 常數與委派
-        private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
-        private const int WH_KEYBOARD_LL = 13;
-        private const int WM_KEYDOWN = 0x0100;
-        private const int WM_KEYUP = 0x0101;
         private const int GWL_EXSTYLE = -20;
         private const int WS_EX_NOACTIVATE = 0x08000000;
-        private const uint IME_CMODE_NATIVE = 0x0001; // IMM: native bit 表示中文輸入
-        private const byte MODE_KEY_CODE = 0xFF; // 自定義的 Mode 虛擬鍵值
-        private const byte FN_KEY_CODE = 0xFE;   // 自定義的 Fn 虛擬鍵值
+        private const uint IME_CMODE_NATIVE = 0x0001;
+        private const byte MODE_KEY_CODE = 0xFF;
+        private const byte FN_KEY_CODE = 0xFE;
         #endregion
 
-        #region 欄位（狀態與 UI 綁定）
-        private LowLevelKeyboardProc? _proc;
-        private IntPtr _hookID = IntPtr.Zero;
+        #region 欄位
         private uint _msgShowOsk;
-        // 修改：使用可為 Null 的 NotifyIcon 以解決 CS8618
         private System.Windows.Forms.NotifyIcon? _notifyIcon;
         private static Mutex? _mutex;
 
         public ObservableCollection<ObservableCollection<KeyModel>> KeyRows { get; set; } = new();
         public ICommand? KeyCommand { get; set; }
 
-        // 目前系統 / 視覺狀態
         private bool _isZhuyinMode = false;
         private bool _isShiftActive = false;
         private bool _isCapsLockActive = false;
         private bool _isCtrlActive = false;
         private bool _isAltActive = false;
         private bool _isWinActive = false;
+
+        private bool _lastPhysicalShiftDown = false;
 
         // 本地虛擬 modifier
         private bool _virtualShiftToggle = false;
@@ -185,12 +155,9 @@ namespace OSK
 
         private bool _localPreviewToggle = false;
 
-        // 臨時英文模式支援
+        // 臨時英文模式
         private bool _temporaryEnglishMode = false;
         private bool _temporaryEnglishFirstUpperSent = false;
-        private bool _temporaryShiftInjected = false;
-
-        private int _suppressInjectedShiftCount = 0;
         private DateTime _ignoreImeSyncUntil = DateTime.MinValue;
 
         private string _modeIndicator = "En";
@@ -198,80 +165,65 @@ namespace OSK
         private string _indicatorColor = "White";
         public string IndicatorColor { get { return _indicatorColor; } set { _indicatorColor = value; OnPropertyChanged("IndicatorColor"); } }
 
-        // Mode 鍵長按處理相關
-        // 修改：直接初始化以避免 CS8618 警告 (建構子可能因 Mutex 檢查提前返回)
+        // Mode 鍵長按處理
         private DispatcherTimer _modeKeyTimer = new DispatcherTimer();
         private bool _modeKeyLongPressHandled = false;
+
+        // 視覺同步
+        private DispatcherTimer? _visualSyncTimer;
+        private int _imeCheckCounter = 0;
 
         // Fn 模式對照表
         private static readonly Dictionary<byte, string?> FnDisplayMap = new()
         {
             [0xC0] = "⎋",
-            [0x31] = "F1",
-            [0x32] = "F2",
-            [0x33] = "F3",
-            [0x34] = "F4",
-            [0x35] = "F5",
-            [0x36] = "F6",
-            [0x37] = "F7",
-            [0x38] = "F8",
-            [0x39] = "F9",
-            [0x30] = "F10",
-            [0xBD] = "F11",
-            [0xBB] = "F12",
-            [0x26] = "⎗",
-            [0x28] = "⎘",
-            [0x25] = "⌂",
-            [0x27] = "⤓",
-            [0x09] = "⌃⌥⌦",
-            [0x08] = "⌦"
+            [0x31] = "F1", [0x32] = "F2", [0x33] = "F3", [0x34] = "F4",
+            [0x35] = "F5", [0x36] = "F6", [0x37] = "F7", [0x38] = "F8",
+            [0x39] = "F9", [0x30] = "F10", [0xBD] = "F11", [0xBB] = "F12",
+            [0x26] = "⎗", [0x28] = "⎘", [0x25] = "⌂", [0x27] = "⤓",
+            [0x09] = "⌃⌥⌦", [0x08] = "⌦"
         };
 
         private static readonly Dictionary<byte, byte> FnSendMap = new()
         {
             [0xC0] = 0x1B,
-            [0x31] = 0x70,
-            [0x32] = 0x71,
-            [0x33] = 0x72,
-            [0x34] = 0x73,
-            [0x35] = 0x74,
-            [0x36] = 0x75,
-            [0x37] = 0x76,
-            [0x38] = 0x77,
-            [0x39] = 0x78,
-            [0x30] = 0x79,
-            [0xBD] = 0x7A,
-            [0xBB] = 0x7B,
-            [0x26] = 0x21,
-            [0x28] = 0x22,
-            [0x25] = 0x24,
-            [0x27] = 0x23,
-            [0x09] = 0x2E,
-            [0x08] = 0x2E
+            [0x31] = 0x70, [0x32] = 0x71, [0x33] = 0x72, [0x34] = 0x73,
+            [0x35] = 0x74, [0x36] = 0x75, [0x37] = 0x76, [0x38] = 0x77,
+            [0x39] = 0x78, [0x30] = 0x79, [0xBD] = 0x7A, [0xBB] = 0x7B,
+            [0x26] = 0x21, [0x28] = 0x22, [0x25] = 0x24, [0x27] = 0x23,
+            [0x09] = 0x2E, [0x08] = 0x2E
         };
 
         private bool _isResizing = false;
         #endregion
 
-        /// <summary>
-        /// 使用 SendInput 注入按鍵事件的 Helper 方法
-        /// </summary>
-        /// <param name="vk">虛擬鍵碼 (Virtual Key)</param>
-        /// <param name="isKeyUp">true 為放開，false 為按下</param>
+        // Helper: 將按鍵加入輸入清單
+        private void AddKeyInput(List<INPUT> inputs, byte vk, bool keyUp)
+        {
+            var input = new INPUT
+            {
+                type = INPUT_KEYBOARD,
+                u = new InputUnion
+                {
+                    ki = new KEYBDINPUT
+                    {
+                        wVk = vk,
+                        wScan = 0,
+                        dwFlags = keyUp ? KEYEVENTF_KEYUP : 0,
+                        time = 0,
+                        dwExtraInfo = IntPtr.Zero
+                    }
+                }
+            };
+            inputs.Add(input);
+        }
+
+        // 舊版單鍵發送 (相容用)
         private void SendSimulatedKey(byte vk, bool isKeyUp)
         {
-            INPUT[] inputs = new INPUT[1];
-            inputs[0].type = INPUT_KEYBOARD;
-            inputs[0].u.ki = new KEYBDINPUT
-            {
-                wVk = vk,
-                wScan = 0,
-                dwFlags = isKeyUp ? KEYEVENTF_KEYUP : 0,
-                time = 0,
-                dwExtraInfo = IntPtr.Zero
-            };
-
-            SendInput(1, inputs, INPUT.Size);
+            var list = new List<INPUT>();
+            AddKeyInput(list, vk, isKeyUp);
+            SendInput((uint)list.Count, list.ToArray(), INPUT.Size);
         }
 
         public MainWindow()
@@ -291,11 +243,9 @@ namespace OSK
             InitializeComponent();
             this.DataContext = this;
 
-            // 初始化 Mode 鍵長按計時器 (已在宣告時建立實體，此處僅設定屬性)
-            _modeKeyTimer.Interval = TimeSpan.FromSeconds(0.2); // 設定秒數
+            _modeKeyTimer.Interval = TimeSpan.FromSeconds(0.2);
             _modeKeyTimer.Tick += ModeKeyTimer_Tick;
 
-            // 在代碼中加入事件處理常式，這樣不需要修改 XAML 即可攔截按鈕的按下與放開
             this.AddHandler(UIElement.PreviewMouseLeftButtonDownEvent, new MouseButtonEventHandler(OnGlobalPreviewMouseDown), true);
             this.AddHandler(UIElement.PreviewMouseLeftButtonUpEvent, new MouseButtonEventHandler(OnGlobalPreviewMouseUp), true);
 
@@ -305,11 +255,7 @@ namespace OSK
             var opacitySlider = this.FindName("OpacitySlider") as System.Windows.Controls.Slider;
             if (opacitySlider != null)
             {
-                try
-                {
-                    opacitySlider.IsMoveToPointEnabled = true;
-                }
-                catch { }
+                try { opacitySlider.IsMoveToPointEnabled = true; } catch { }
                 opacitySlider.PreviewMouseLeftButtonDown += OpacitySlider_PreviewMouseLeftButtonDown;
             }
 
@@ -318,23 +264,16 @@ namespace OSK
 
             KeyBoardItemsControl.ItemsSource = KeyRows;
 
-            _msgShowOsk = RegisterWindowMessage("WM_SHOW_OSK");
-
             System.Drawing.Icon? trayIcon = null;
-
             try
             {
                 string exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName ?? "";
-                
                 if (!string.IsNullOrEmpty(exePath) && System.IO.File.Exists(exePath))
                 {
                     trayIcon = System.Drawing.Icon.ExtractAssociatedIcon(exePath);
                 }
             }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"圖示提取失敗: {ex.Message}");
-            }
+            catch { }
 
             if (trayIcon == null)
             {
@@ -342,44 +281,32 @@ namespace OSK
                 {
                     var resourceUri = new Uri("pack://application:,,,/Assets/app.ico");
                     var streamInfo = System.Windows.Application.GetResourceStream(resourceUri);
-                    if (streamInfo != null)
-                    {
-                        trayIcon = new System.Drawing.Icon(streamInfo.Stream);
-                    }
+                    if (streamInfo != null) trayIcon = new System.Drawing.Icon(streamInfo.Stream);
                 }
                 catch { }
             }
+            if (trayIcon == null) trayIcon = SystemIcons.Application;
 
-            if (trayIcon == null)
-            {
-                trayIcon = SystemIcons.Application;
-            }
-
-            // 初始化 NotifyIcon
             _notifyIcon = new System.Windows.Forms.NotifyIcon { Icon = trayIcon, Visible = true, Text = "OSK" };
             _notifyIcon.Click += (s, e) => ToggleVisibility();
             var menu = new System.Windows.Forms.ContextMenuStrip();
             menu.Items.Add("結束", null, (s, e) => System.Windows.Application.Current.Shutdown());
             _notifyIcon.ContextMenuStrip = menu;
 
-            _proc = HookCallback;
-            _hookID = SetHook(_proc);
-
-            DispatcherTimer timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150) };
-            timer.Tick += (s, e) => SyncStates();
-            timer.Start();
+            _visualSyncTimer = new DispatcherTimer(DispatcherPriority.Render);
+            _visualSyncTimer.Interval = TimeSpan.FromMilliseconds(30);
+            _visualSyncTimer.Tick += VisualSyncTimer_Tick;
+            _visualSyncTimer.Start();
         }
 
         #region Mode 鍵長按處理邏輯
 
         private void OnGlobalPreviewMouseDown(object sender, MouseButtonEventArgs e)
         {
-            // 檢查事件來源的 DataContext 是否為 KeyModel
             if ((e.OriginalSource as FrameworkElement)?.DataContext is KeyModel key)
             {
                 if (key.VkCode == MODE_KEY_CODE)
                 {
-                    // 重置狀態並啟動計時器
                     _modeKeyLongPressHandled = false;
                     _modeKeyTimer.Start();
                 }
@@ -388,27 +315,21 @@ namespace OSK
 
         private void OnGlobalPreviewMouseUp(object sender, MouseButtonEventArgs e)
         {
-            // 無論哪個鍵放開，都停止計時器以防萬一
             _modeKeyTimer.Stop();
         }
 
         private void ModeKeyTimer_Tick(object? sender, EventArgs e)
         {
-            // 長按時間到（1秒）：立刻切換版面，不等待放開
             _modeKeyTimer.Stop();
-            _modeKeyLongPressHandled = true; // 標記為已處理，避免放開時觸發短按邏輯
+            _modeKeyLongPressHandled = true;
 
-            // 執行「僅切換版面，不切換輸入法」的邏輯
             _isZhuyinMode = !_isZhuyinMode;
             
-            // 重置其他相關狀態
             _localPreviewToggle = false;
             _temporaryEnglishMode = false;
             _temporaryEnglishFirstUpperSent = false;
-            _temporaryShiftInjected = false;
             _virtualShiftToggle = false;
 
-            // 更新 UI 顯示
             UpdateDisplay();
         }
 
@@ -443,92 +364,66 @@ namespace OSK
             if (this.Top + h > waTop + waHeight) this.Top = waTop + waHeight - h;
         }
 
-        private IntPtr SetHook(LowLevelKeyboardProc proc)
+        private void VisualSyncTimer_Tick(object? sender, EventArgs e)
         {
-            using (var curProcess = System.Diagnostics.Process.GetCurrentProcess())
-            using (var curModule = curProcess.MainModule)
+            // 偵測實體按鍵狀態 (High bit set = key is down)
+            bool physShift = (GetAsyncKeyState(0x10) & 0x8000) != 0;
+            bool physCtrl = (GetAsyncKeyState(0x11) & 0x8000) != 0;
+            bool physAlt = (GetAsyncKeyState(0x12) & 0x8000) != 0;
+            bool physWin = (GetAsyncKeyState(0x5B) & 0x8000) != 0;
+
+            // Shift Rising Edge 偵測 (觸發臨時模式)
+            if (physShift && !_lastPhysicalShiftDown)
             {
-                return SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(curModule!.ModuleName!), 0);
-            }
-        }
-
-        private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
-        {
-            if (nCode >= 0)
-            {
-                var kbd = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
-                int vk = (int)kbd.vkCode;
-                uint flags = kbd.flags;
-                bool injected = (flags & 0x10u) != 0; // LLKHF_INJECTED
-                bool pressed = (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)0x0104);
-                bool released = (wParam == (IntPtr)WM_KEYUP || wParam == (IntPtr)0x0105);
-
-                if ((vk == 0x10 || vk == 0xA0 || vk == 0xA1) && (injected || _suppressInjectedShiftCount > 0))
+                if (_isZhuyinMode)
                 {
-                    if (_suppressInjectedShiftCount > 0) _suppressInjectedShiftCount--;
-                    return CallNextHookEx(_hookID, nCode, wParam, lParam);
-                }
-
-                if (pressed)
-                {
-                    if ((vk == 0x10 || vk == 0xA0 || vk == 0xA1) && _isZhuyinMode)
-                    {
-                        _temporaryEnglishMode = true;
-                        _temporaryEnglishFirstUpperSent = false;
-                        UpdateDisplay();
-                    }
-
-                    if (_temporaryEnglishMode)
-                    {
-                        bool isAlpha = vk >= 0x41 && vk <= 0x5A;
-                        bool physicalShiftDown = (GetKeyState(0x10) & 0x8000) != 0;
-                        if (isAlpha && !_temporaryEnglishFirstUpperSent && !physicalShiftDown)
-                        {
-                            _suppressInjectedShiftCount += 2;
-                            SendSimulatedKey(0x10, false); // Shift down
-                            _temporaryShiftInjected = true;
-                        }
-
-                        if (vk == 0x0D)
-                        {
-                            _temporaryEnglishMode = false;
-                            _temporaryEnglishFirstUpperSent = false;
-                            UpdateDisplay();
-                        }
-                    }
-                }
-
-                if (released)
-                {
-                    bool isAlpha = vk >= 0x41 && vk <= 0x5A;
-                    if (_temporaryShiftInjected && isAlpha)
-                    {
-                        SendSimulatedKey(0x10, true); // Shift up
-                        _temporaryShiftInjected = false;
-                        _temporaryEnglishFirstUpperSent = true;
-                        UpdateDisplay();
-                    }
-                }
-
-                if (pressed || released)
-                {
-                    foreach (var row in KeyRows)
-                        foreach (var k in row)
-                            if (k.VkCode == vk || ((vk == 0xA0 || vk == 0xA1) && k.VkCode == 0x10)) k.IsPressed = pressed;
+                    _temporaryEnglishMode = true;
+                    _temporaryEnglishFirstUpperSent = false;
+                    UpdateDisplay();
                 }
             }
-            return CallNextHookEx(_hookID, nCode, wParam, lParam);
-        }
+            // Shift Falling Edge
+            else if (!physShift && _lastPhysicalShiftDown)
+            {
+                // 可在此處理放開 Shift 後的行為
+            }
 
-        private void SyncStates()
-        {
+            _lastPhysicalShiftDown = physShift;
+
+            // 更新全域狀態
             _isCapsLockActive = (GetKeyState(0x14) & 0x0001) != 0;
-            _isShiftActive = ((GetKeyState(0x10) & 0x8000) != 0) || _virtualShiftToggle;
-            _isCtrlActive = ((GetKeyState(0x11) & 0x8000) != 0) || _virtualCtrlToggle;
-            _isAltActive = ((GetKeyState(0x12) & 0x8000) != 0) || _virtualAltToggle;
-            _isWinActive = ((GetKeyState(0x5B) & 0x8000) != 0) || _virtualWinToggle;
+            _isShiftActive = physShift || _virtualShiftToggle;
+            _isCtrlActive = physCtrl || _virtualCtrlToggle;
+            _isAltActive = physAlt || _virtualAltToggle;
+            _isWinActive = physWin || _virtualWinToggle;
 
-            DetectImeStatus();
+            // 更新虛擬鍵盤按壓效果
+            foreach (var row in KeyRows)
+            {
+                foreach (var k in row)
+                {
+                    if (k.VkCode == MODE_KEY_CODE || k.VkCode == FN_KEY_CODE) continue;
+                    
+                    bool isPhysicallyPressed = (GetAsyncKeyState(k.VkCode) & 0x8000) != 0;
+                    
+                    if (k.VkCode == 0x10) isPhysicallyPressed = physShift;
+                    else if (k.VkCode == 0x11) isPhysicallyPressed = physCtrl;
+                    else if (k.VkCode == 0x12) isPhysicallyPressed = physAlt;
+
+                    if (k.IsPressed != isPhysicallyPressed)
+                    {
+                        k.IsPressed = isPhysicallyPressed;
+                    }
+                }
+            }
+
+            _imeCheckCounter++;
+            if (_imeCheckCounter >= 10)
+            {
+                _imeCheckCounter = 0;
+                DetectImeStatus();
+            }
+
             UpdateDisplay();
         }
 
@@ -565,6 +460,7 @@ namespace OSK
                     {
                         _isZhuyinMode = isChinese;
                         _localPreviewToggle = false;
+                        UpdateDisplay();
                     }
                 }
                 ImmReleaseContext(targetHwnd, hIMC);
@@ -595,41 +491,28 @@ namespace OSK
         {
             if (key == null) return;
 
+            // 1. 處理特殊功能鍵 (Mode, Fn, Toggles)
             if (key.VkCode == MODE_KEY_CODE)
             {
-                // 如果長按事件已經處理過（已經在計時器 Tick 中切換了版面），
-                // 則這裡（放開/Click 事件）直接返回，不再執行短按邏輯。
-                if (_modeKeyLongPressHandled)
-                {
-                    _modeKeyLongPressHandled = false;
-                    return;
-                }
+                if (_modeKeyLongPressHandled) { _modeKeyLongPressHandled = false; return; }
 
-                // 以下為短按邏輯：切換版面並發送 Shift
                 if (_virtualFnToggle)
                 {
                     _localPreviewToggle = !_localPreviewToggle;
                     _temporaryEnglishMode = false;
                     _temporaryEnglishFirstUpperSent = false;
-                    _temporaryShiftInjected = false;
                     _virtualShiftToggle = false;
                     UpdateDisplay();
                     return;
                 }
 
-                _suppressInjectedShiftCount = 2;
-                SendSimulatedKey(0x10, false); // Shift down
-                Thread.Sleep(5);
-                SendSimulatedKey(0x10, true);  // Shift up
-
+                // 模擬 Shift 切換輸入法
+                SendSimulatedKey(0x10, false); Thread.Sleep(5); SendSimulatedKey(0x10, true);
                 _isZhuyinMode = !_isZhuyinMode;
                 _ignoreImeSyncUntil = DateTime.UtcNow.AddMilliseconds(300);
-
                 _temporaryEnglishMode = false;
                 _temporaryEnglishFirstUpperSent = false;
-                _temporaryShiftInjected = false;
                 _virtualShiftToggle = false;
-
                 UpdateDisplay();
                 return;
             }
@@ -639,14 +522,7 @@ namespace OSK
             if (key.VkCode == 0x12)
             {
                 _virtualAltToggle = !_virtualAltToggle;
-                if (_virtualAltToggle)
-                {
-                    SendSimulatedKey(0x12, false); // Alt down
-                }
-                else
-                {
-                    SendSimulatedKey(0x12, true);  // Alt up
-                }
+                if (_virtualAltToggle) SendSimulatedKey(0x12, false); else SendSimulatedKey(0x12, true);
                 UpdateDisplay();
                 return;
             }
@@ -664,78 +540,79 @@ namespace OSK
             if (_virtualFnToggle && key.VkCode == 0x09)
             {
                 ShowSecurityMenu();
-
-                if (!_temporaryEnglishMode)
-                {
-                    _virtualShiftToggle = false;
-                    _virtualCtrlToggle = false;
-                    _virtualWinToggle = false;
-                }
+                if (!_temporaryEnglishMode) { _virtualShiftToggle = false; _virtualCtrlToggle = false; _virtualWinToggle = false; }
                 UpdateDisplay();
                 return;
             }
 
+            // 2. 決定要發送的按鍵代碼 (處理 Fn 對應)
             byte sendVk = key.VkCode;
             if (_virtualFnToggle && FnSendMap.TryGetValue(key.VkCode, out byte targetVk)) sendVk = targetVk;
+            if (_virtualAltToggle && key.VkCode >= 0x30 && key.VkCode <= 0x39) sendVk = (byte)(0x60 + (key.VkCode - 0x30));
 
-            if (_virtualAltToggle && key.VkCode >= 0x30 && key.VkCode <= 0x39)
-            {
-                sendVk = (byte)(0x60 + (key.VkCode - 0x30));
-            }
-
+            // 3. 特殊組合鍵 (工作管理員)
             if (sendVk == 0x2E && _isCtrlActive && _isAltActive)
             {
-                try
-                {
-                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("taskmgr") { UseShellExecute = true });
-                }
-                catch
-                {
-                    SendSimulatedKey(sendVk, false);
-                    SendSimulatedKey(sendVk, true);
-                }
-
-                if (!_temporaryEnglishMode)
-                {
-                    _virtualShiftToggle = false;
-                    _virtualCtrlToggle = false;
-                    _virtualWinToggle = false;
-                }
+                TryStartTaskManager();
+                if (!_temporaryEnglishMode) { _virtualShiftToggle = false; _virtualCtrlToggle = false; _virtualWinToggle = false; }
                 UpdateDisplay();
                 return;
             }
 
-            var mods = new List<byte>();
-            if (_isCtrlActive) { SendSimulatedKey(0x11, false); mods.Add(0x11); }
-            if (_isAltActive && !_virtualAltToggle) { SendSimulatedKey(0x12, false); mods.Add(0x12); }
-            if (_isWinActive) { SendSimulatedKey(0x5B, false); mods.Add(0x5B); }
-
+            // 4. 準備發送按鍵 - 重大修正：正確處理 Shift 狀態
             bool isAlpha = sendVk >= 0x41 && sendVk <= 0x5A;
+            bool physShift = (GetAsyncKeyState(0x10) & 0x8000) != 0;
+            
+            // 判斷是否需要注入虛擬 Shift
+            // 條件：(虛擬Shift開啟) 或 (臨時英文模式且是首字)
+            bool needInjectShift = _virtualShiftToggle;
 
             if (_temporaryEnglishMode && isAlpha)
             {
                 if (!_temporaryEnglishFirstUpperSent)
                 {
-                    SendSimulatedKey(0x10, false); // Shift down
-                    SendSimulatedKey(sendVk, false);
-                    SendSimulatedKey(sendVk, true);
-                    SendSimulatedKey(0x10, true);  // Shift up
+                    needInjectShift = true; // 強制首字大寫
                     _temporaryEnglishFirstUpperSent = true;
                 }
                 else
                 {
-                    SendSimulatedKey(sendVk, false);
-                    SendSimulatedKey(sendVk, true);
+                    // 若不是首字，理論上要小寫，但若實體 Shift 按著，我們無法強制變小寫，只能依循實體狀態
                 }
             }
-            else
+
+            // 如果實體 Shift 已經按著，我們不需要注入 Shift (因為已經有了)
+            // 除非我們想取消它 (太複雜且易錯)，所以這裡只要確保 "若實體沒按，但我們需要大寫，則注入"
+            bool effectiveShiftInject = needInjectShift && !physShift;
+
+            // 建立輸入序列
+            var inputs = new List<INPUT>();
+
+            // 注入 Modifier Down
+            if (_virtualCtrlToggle) AddKeyInput(inputs, 0x11, false);
+            if (_virtualAltToggle && !_virtualAltToggle) { /* Alt 已經在 Toggle 時按下了，這裡不用重複按 */ }
+            if (_virtualWinToggle) AddKeyInput(inputs, 0x5B, false);
+            
+            // 關鍵修正：Shift 注入
+            if (effectiveShiftInject) AddKeyInput(inputs, 0x10, false);
+
+            // 按下與放開目標鍵
+            AddKeyInput(inputs, sendVk, false);
+            AddKeyInput(inputs, sendVk, true);
+
+            // 注入 Modifier Up (順序反過來)
+            if (effectiveShiftInject) AddKeyInput(inputs, 0x10, true);
+            
+            if (_virtualWinToggle) AddKeyInput(inputs, 0x5B, true);
+            // Alt 需維持按壓狀態直到 Toggle 解除，所以不在此放開
+            if (_virtualCtrlToggle) AddKeyInput(inputs, 0x11, true);
+
+            // 發送所有輸入
+            if (inputs.Count > 0)
             {
-                SendSimulatedKey(sendVk, false);
-                SendSimulatedKey(sendVk, true);
+                SendInput((uint)inputs.Count, inputs.ToArray(), INPUT.Size);
             }
 
-            for (int i = mods.Count - 1; i >= 0; i--) SendSimulatedKey(mods[i], true);
-
+            // 5. 狀態清理
             if (sendVk != 0x11 && sendVk != 0x12 && sendVk != 0x10 && sendVk != 0x5B)
             {
                 if (!_temporaryEnglishMode)
@@ -872,14 +749,14 @@ namespace OSK
             r3.Add(new KeyModel { English = "a", EnglishUpper = "A", Zhuyin = "ㄇ", VkCode = 0x41 });
             r3.Add(new KeyModel { English = "s", EnglishUpper = "S", Zhuyin = "ㄋ", VkCode = 0x53 });
             r3.Add(new KeyModel { English = "d", EnglishUpper = "D", Zhuyin = "ㄎ", VkCode = 0x44 });
-            r3.Add(new KeyModel { English = "f", EnglishUpper = "F", Zhuyin = "ㄙ", VkCode = 0x46 });
+            r3.Add(new KeyModel { English = "f", EnglishUpper = "F", Zhuyin = "ㄑ", VkCode = 0x46 });
             r3.Add(new KeyModel { English = "g", EnglishUpper = "G", Zhuyin = "ㄕ", VkCode = 0x47 });
             r3.Add(new KeyModel { English = "h", EnglishUpper = "H", Zhuyin = "ㄘ", VkCode = 0x48 });
             r3.Add(new KeyModel { English = "j", EnglishUpper = "J", Zhuyin = "ㄨ", VkCode = 0x4A });
             r3.Add(new KeyModel { English = "k", EnglishUpper = "K", Zhuyin = "ㄜ", VkCode = 0x4B });
             r3.Add(new KeyModel { English = "l", EnglishUpper = "L", Zhuyin = "ㄠ", VkCode = 0x4C });
             r3.Add(new KeyModel { English = ";", EnglishUpper = ":", Zhuyin = "ㄤ", VkCode = 0xBA });
-            r3.Add(new KeyModel { English = "'", EnglishUpper = "\"", Zhuyin = "ㄦ", VkCode = 0xDE });
+            r3.Add(new KeyModel { English = "'", EnglishUpper = "\"", Zhuyin = "", VkCode = 0xDE });
             r3.Add(new KeyModel { English = "⏎", EnglishUpper = "Enter", Zhuyin = "送出", VkCode = 0x0D, Width = 98 });
             KeyRows.Add(r3);
 
@@ -928,7 +805,7 @@ namespace OSK
             }
         }
 
-        protected override void OnClosed(EventArgs e) { UnhookWindowsHookEx(_hookID); _notifyIcon?.Dispose(); base.OnClosed(e); }
+        protected override void OnClosed(EventArgs e) { _notifyIcon?.Dispose(); base.OnClosed(e); }
 
         protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
         {
