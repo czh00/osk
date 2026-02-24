@@ -6,16 +6,16 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
-    <Version>1.0.0</Version>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
-    <Title>0OSK v1.0.2</Title>
+    <Version>1.0.5</Version>
+    <AssemblyVersion>$(Version)</AssemblyVersion>
+    <FileVersion>$(Version)</FileVersion>
+    <Title>OSK</Title>
 
-    <!-- ¹Ï¥Ü»P apphost¡]¥²­n¥H¦b exe ¤WÅã¥Ü icon¡^ -->
+    <!-- åœ–ç¤ºèˆ‡ apphostï¼ˆå¿…è¦ä»¥åœ¨ exe ä¸Šé¡¯ç¤º iconï¼‰ -->
     <UseAppHost>true</UseAppHost>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
 
-    <!-- µo§G³]¸m¡]¥i¨Ì»Ý¨D½Õ¾ã SelfContained/PublishSingleFile¡^ -->
+    <!-- ç™¼ä½ˆè¨­ç½®ï¼ˆå¯ä¾éœ€æ±‚èª¿æ•´ SelfContained/PublishSingleFileï¼‰ -->
     <SelfContained>false</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
     <PublishReadyToRun>true</PublishReadyToRun>
@@ -40,7 +40,7 @@
     </EmbeddedResource>
   </ItemGroup>
 
-  <!-- ½T«O icon ÀÉ¥]§t¦b±M®×¤¤ -->
+  <!-- ç¢ºä¿ icon æª”åŒ…å«åœ¨å°ˆæ¡ˆä¸­ -->
   <ItemGroup>
     <None Include="Assets\app.ico" Pack="true" Visible="true" />
   </ItemGroup>
