@@ -26,7 +26,7 @@ namespace OSK
     public partial class MainWindow : Window, INotifyPropertyChanged
     {
         #region Win32 / IMM API 宣告
-        private InputDetector _inputDetector;
+        private InputDetector? _inputDetector;
         [DllImport("user32.dll")] private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
         [DllImport("user32.dll")] private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
 
