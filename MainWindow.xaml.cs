@@ -13,20 +13,20 @@ using System.Windows.Threading;
 using System.Threading;
 using System.Windows.Media;
 using System.Reflection;
+using Microsoft.Win32;
 
 namespace OSK
 {
     /// <summary>
     /// 主視窗：一個可停靠、非啟動激活的虛擬鍵盤 (WPF)。
-    /// 修改說明：
-    /// - 修正 OnKeyClick 邏輯：確保 Shift+任意鍵能正確送出大寫字母。
-    /// - 使用 GetAsyncKeyState 與 Timer 輪詢同步實體鍵盤。
-    /// - 使用批次 SendInput 優化按鍵發送穩定性。
+    /// 2025/02/12 Update:
+    ///   - 修正 Shift 鍵與功能鍵的文字顏色，使其維持藍色系字體 (使用 _themeSubColor / _themeActiveColor)。
+    ///   - 優化淺色模式配色，將次要文字顏色改為藍色。
     /// </summary>
     public partial class MainWindow : Window, INotifyPropertyChanged
     {
         #region Win32 / IMM API 宣告
-
+        private InputDetector _inputDetector;
         [DllImport("user32.dll")] private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
         [DllImport("user32.dll")] private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
 
@@ -136,6 +136,7 @@ namespace OSK
 
         public ObservableCollection<ObservableCollection<KeyModel>> KeyRows { get; set; } = new();
         public ICommand? KeyCommand { get; set; }
+        public ICommand? ToggleThemeCommand { get; set; }
 
         private bool _isZhuyinMode = false;
         private bool _isShiftActive = false;
@@ -157,13 +158,41 @@ namespace OSK
 
         // 臨時英文模式
         private bool _temporaryEnglishMode = false;
-        private bool _temporaryEnglishFirstUpperSent = false;
         private DateTime _ignoreImeSyncUntil = DateTime.MinValue;
 
         private string _modeIndicator = "En";
         public string ModeIndicator { get { return _modeIndicator; } set { _modeIndicator = value; OnPropertyChanged("ModeIndicator"); } }
+        
         private string _indicatorColor = "White";
         public string IndicatorColor { get { return _indicatorColor; } set { _indicatorColor = value; OnPropertyChanged("IndicatorColor"); } }
+
+        // --- 主題相關屬性 ---
+        private bool _isDarkMode = true; 
+        
+        // 主題圖示 (🌙/☀)
+        private string _themeIcon = "🌙";
+        public string ThemeIcon { get { return _themeIcon; } set { _themeIcon = value; OnPropertyChanged("ThemeIcon"); } }
+        
+        // 視窗背景
+        private string _windowBackground = "#1E1E1E";
+        public string WindowBackground { get { return _windowBackground; } set { _windowBackground = value; OnPropertyChanged("WindowBackground"); } }
+
+        // UI 介面文字/圖示顏色 (用於控制列按鈕、標籤)
+        private string _uiTextColor = "White";
+        public string UiTextColor { get { return _uiTextColor; } set { _uiTextColor = value; OnPropertyChanged("UiTextColor"); } }
+
+        // 縮放手柄顏色 (Resize Grip)
+        private string _resizeGripColor = "#888888";
+        public string ResizeGripColor { get { return _resizeGripColor; } set { _resizeGripColor = value; OnPropertyChanged("ResizeGripColor"); } }
+
+        // 視窗控制按鈕背景 (最小化按鈕)
+        private string _controlBtnBackground = "#333333";
+        public string ControlBtnBackground { get { return _controlBtnBackground; } set { _controlBtnBackground = value; OnPropertyChanged("ControlBtnBackground"); } }
+        
+        // 用於切換文字顏色
+        private string _themeTextColor = "White";
+        private string _themeActiveColor = "Cyan";
+        private string _themeSubColor = "LightBlue";
 
         // Mode 鍵長按處理
         private DispatcherTimer _modeKeyTimer = new DispatcherTimer();
@@ -260,9 +289,13 @@ namespace OSK
             }
 
             KeyCommand = new RelayCommand<KeyModel>(OnKeyClick);
-            SetupKeyboard();
+            ToggleThemeCommand = new RelayCommand<object>(ToggleTheme);
 
+            SetupKeyboard();
             KeyBoardItemsControl.ItemsSource = KeyRows;
+            
+            // 初始化主題 (偵測系統)
+            DetectSystemTheme();
 
             System.Drawing.Icon? trayIcon = null;
             try
@@ -297,7 +330,92 @@ namespace OSK
             _visualSyncTimer.Interval = TimeSpan.FromMilliseconds(30);
             _visualSyncTimer.Tick += VisualSyncTimer_Tick;
             _visualSyncTimer.Start();
+            _inputDetector = new InputDetector(this);
+            _inputDetector.Start();
         }
+
+        #region 主題切換邏輯
+
+        private void DetectSystemTheme()
+        {
+            try
+            {
+                using (RegistryKey? key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    if (key != null)
+                    {
+                        object? val = key.GetValue("AppsUseLightTheme");
+                        if (val is int iVal)
+                        {
+                            bool isSystemLight = (iVal == 1);
+                            ApplyTheme(!isSystemLight);
+                            return;
+                        }
+                    }
+                }
+            }
+            catch { }
+            ApplyTheme(true);
+        }
+
+        private void ToggleTheme(object? parameter)
+        {
+            ApplyTheme(!_isDarkMode);
+        }
+
+        private void ApplyTheme(bool isDark)
+        {
+            _isDarkMode = isDark;
+
+            if (_isDarkMode)
+            {
+                // 深色模式
+                ThemeIcon = "☀";
+                WindowBackground = "#1E1E1E";
+                
+                // UI 介面顏色
+                UiTextColor = "White";             
+                ResizeGripColor = "#AAAAAA";       
+                ControlBtnBackground = "#333333";  
+                
+                // 按鍵顏色
+                _themeTextColor = "White";
+                _themeActiveColor = "Cyan";
+                _themeSubColor = "LightBlue";
+                IndicatorColor = "White";
+            }
+            else
+            {
+                // 淺色模式
+                ThemeIcon = "🌙";
+                WindowBackground = "#F0F0F0";
+                
+                // UI 介面顏色
+                UiTextColor = "#333333";           
+                ResizeGripColor = "#666666";       
+                ControlBtnBackground = "#DDDDDD";  
+                
+                // 按鍵顏色
+                _themeTextColor = "#333333";
+                _themeActiveColor = "#0078D7"; 
+                _themeSubColor = "#0078D7";    
+                IndicatorColor = "#333333";
+            }
+
+            foreach (var row in KeyRows)
+            {
+                foreach (var k in row)
+                {
+                    if (_isDarkMode)
+                        k.SetThemeColors("#333333", "#666666");
+                    else
+                        k.SetThemeColors("#FFFFFF", "#DDDDDD");
+                }
+            }
+            UpdateDisplay();
+        }
+
+        #endregion
 
         #region Mode 鍵長按處理邏輯
 
@@ -327,7 +445,6 @@ namespace OSK
             
             _localPreviewToggle = false;
             _temporaryEnglishMode = false;
-            _temporaryEnglishFirstUpperSent = false;
             _virtualShiftToggle = false;
 
             UpdateDisplay();
@@ -366,38 +483,28 @@ namespace OSK
 
         private void VisualSyncTimer_Tick(object? sender, EventArgs e)
         {
-            // 偵測實體按鍵狀態 (High bit set = key is down)
             bool physShift = (GetAsyncKeyState(0x10) & 0x8000) != 0;
             bool physCtrl = (GetAsyncKeyState(0x11) & 0x8000) != 0;
             bool physAlt = (GetAsyncKeyState(0x12) & 0x8000) != 0;
             bool physWin = (GetAsyncKeyState(0x5B) & 0x8000) != 0;
 
-            // Shift Rising Edge 偵測 (觸發臨時模式)
             if (physShift && !_lastPhysicalShiftDown)
             {
                 if (_isZhuyinMode)
                 {
                     _temporaryEnglishMode = true;
-                    _temporaryEnglishFirstUpperSent = false;
                     UpdateDisplay();
                 }
-            }
-            // Shift Falling Edge
-            else if (!physShift && _lastPhysicalShiftDown)
-            {
-                // 可在此處理放開 Shift 後的行為
             }
 
             _lastPhysicalShiftDown = physShift;
 
-            // 更新全域狀態
             _isCapsLockActive = (GetKeyState(0x14) & 0x0001) != 0;
             _isShiftActive = physShift || _virtualShiftToggle;
             _isCtrlActive = physCtrl || _virtualCtrlToggle;
             _isAltActive = physAlt || _virtualAltToggle;
             _isWinActive = physWin || _virtualWinToggle;
 
-            // 更新虛擬鍵盤按壓效果
             foreach (var row in KeyRows)
             {
                 foreach (var k in row)
@@ -491,7 +598,6 @@ namespace OSK
         {
             if (key == null) return;
 
-            // 1. 處理特殊功能鍵 (Mode, Fn, Toggles)
             if (key.VkCode == MODE_KEY_CODE)
             {
                 if (_modeKeyLongPressHandled) { _modeKeyLongPressHandled = false; return; }
@@ -500,18 +606,15 @@ namespace OSK
                 {
                     _localPreviewToggle = !_localPreviewToggle;
                     _temporaryEnglishMode = false;
-                    _temporaryEnglishFirstUpperSent = false;
                     _virtualShiftToggle = false;
                     UpdateDisplay();
                     return;
                 }
 
-                // 模擬 Shift 切換輸入法
                 SendSimulatedKey(0x10, false); Thread.Sleep(5); SendSimulatedKey(0x10, true);
                 _isZhuyinMode = !_isZhuyinMode;
                 _ignoreImeSyncUntil = DateTime.UtcNow.AddMilliseconds(300);
                 _temporaryEnglishMode = false;
-                _temporaryEnglishFirstUpperSent = false;
                 _virtualShiftToggle = false;
                 UpdateDisplay();
                 return;
@@ -530,8 +633,7 @@ namespace OSK
 
             if (key.VkCode == 0x10 && _isZhuyinMode)
             {
-                _temporaryEnglishMode = true;
-                _temporaryEnglishFirstUpperSent = false;
+                _temporaryEnglishMode = !_temporaryEnglishMode;
                 UpdateDisplay();
                 return;
             }
@@ -545,12 +647,10 @@ namespace OSK
                 return;
             }
 
-            // 2. 決定要發送的按鍵代碼 (處理 Fn 對應)
             byte sendVk = key.VkCode;
             if (_virtualFnToggle && FnSendMap.TryGetValue(key.VkCode, out byte targetVk)) sendVk = targetVk;
             if (_virtualAltToggle && key.VkCode >= 0x30 && key.VkCode <= 0x39) sendVk = (byte)(0x60 + (key.VkCode - 0x30));
 
-            // 3. 特殊組合鍵 (工作管理員)
             if (sendVk == 0x2E && _isCtrlActive && _isAltActive)
             {
                 TryStartTaskManager();
@@ -559,60 +659,37 @@ namespace OSK
                 return;
             }
 
-            // 4. 準備發送按鍵 - 重大修正：正確處理 Shift 狀態
-            bool isAlpha = sendVk >= 0x41 && sendVk <= 0x5A;
             bool physShift = (GetAsyncKeyState(0x10) & 0x8000) != 0;
-            
-            // 判斷是否需要注入虛擬 Shift
-            // 條件：(虛擬Shift開啟) 或 (臨時英文模式且是首字)
             bool needInjectShift = _virtualShiftToggle;
 
-            if (_temporaryEnglishMode && isAlpha)
+            if (_temporaryEnglishMode)
             {
-                if (!_temporaryEnglishFirstUpperSent)
-                {
-                    needInjectShift = true; // 強制首字大寫
-                    _temporaryEnglishFirstUpperSent = true;
-                }
-                else
-                {
-                    // 若不是首字，理論上要小寫，但若實體 Shift 按著，我們無法強制變小寫，只能依循實體狀態
-                }
+                needInjectShift = true;
             }
 
-            // 如果實體 Shift 已經按著，我們不需要注入 Shift (因為已經有了)
-            // 除非我們想取消它 (太複雜且易錯)，所以這裡只要確保 "若實體沒按，但我們需要大寫，則注入"
             bool effectiveShiftInject = needInjectShift && !physShift;
 
-            // 建立輸入序列
             var inputs = new List<INPUT>();
 
-            // 注入 Modifier Down
             if (_virtualCtrlToggle) AddKeyInput(inputs, 0x11, false);
-            if (_virtualAltToggle && !_virtualAltToggle) { /* Alt 已經在 Toggle 時按下了，這裡不用重複按 */ }
+            if (_virtualAltToggle && !_virtualAltToggle) { }
             if (_virtualWinToggle) AddKeyInput(inputs, 0x5B, false);
             
-            // 關鍵修正：Shift 注入
             if (effectiveShiftInject) AddKeyInput(inputs, 0x10, false);
 
-            // 按下與放開目標鍵
             AddKeyInput(inputs, sendVk, false);
             AddKeyInput(inputs, sendVk, true);
 
-            // 注入 Modifier Up (順序反過來)
             if (effectiveShiftInject) AddKeyInput(inputs, 0x10, true);
             
             if (_virtualWinToggle) AddKeyInput(inputs, 0x5B, true);
-            // Alt 需維持按壓狀態直到 Toggle 解除，所以不在此放開
             if (_virtualCtrlToggle) AddKeyInput(inputs, 0x11, true);
 
-            // 發送所有輸入
             if (inputs.Count > 0)
             {
                 SendInput((uint)inputs.Count, inputs.ToArray(), INPUT.Size);
             }
 
-            // 5. 狀態清理
             if (sendVk != 0x11 && sendVk != 0x12 && sendVk != 0x10 && sendVk != 0x5B)
             {
                 if (!_temporaryEnglishMode)
@@ -626,7 +703,6 @@ namespace OSK
             if (_temporaryEnglishMode && key.VkCode == 0x0D)
             {
                 _temporaryEnglishMode = false;
-                _temporaryEnglishFirstUpperSent = false;
             }
 
             UpdateDisplay();
@@ -639,12 +715,20 @@ namespace OSK
 
             bool displayZhuyin = _localPreviewToggle ? !_isZhuyinMode : _isZhuyinMode;
             ModeIndicator = displayZhuyin ? "En" : "ㄅ";
-            IndicatorColor = displayZhuyin ? "Orange" : "White";
+            
+            if (displayZhuyin)
+            {
+                IndicatorColor = _isDarkMode ? "Orange" : "#D2691E";
+            }
+            else
+            {
+                IndicatorColor = _isDarkMode ? "White" : "#333333";
+            }
 
             if (_temporaryEnglishMode)
             {
                 ModeIndicator = "En";
-                IndicatorColor = "Cyan";
+                IndicatorColor = _themeActiveColor;
             }
 
             foreach (var row in KeyRows)
@@ -660,45 +744,72 @@ namespace OSK
 
                     if (_virtualFnToggle && FnDisplayMap.TryGetValue(k.VkCode, out string? fnLabel))
                     {
-                        if (!string.IsNullOrEmpty(fnLabel)) { k.DisplayName = fnLabel!; k.TextColor = "LightBlue"; continue; }
+                        if (!string.IsNullOrEmpty(fnLabel)) { k.DisplayName = fnLabel!; k.TextColor = _themeSubColor; continue; }
                     }
 
                     if (k.VkCode == FN_KEY_CODE)
                     {
                         k.DisplayName = "⌨";
-                        k.TextColor = _virtualFnToggle ? "Cyan" : "White";
+                        k.TextColor = _virtualFnToggle ? _themeActiveColor : _themeTextColor;
                         continue;
                     }
 
                     bool isAlpha = k.VkCode >= 0x41 && k.VkCode <= 0x5A;
+                    bool isZhuyinShiftState = _isZhuyinMode && (_isShiftActive || _temporaryEnglishMode);
+
+                    if (isZhuyinShiftState)
+                    {
+                        string? overrideLabel = null;
+                        switch (k.VkCode)
+                        {
+                            case 0x31: overrideLabel = "！"; break;
+                            case 0x32: overrideLabel = "@"; break;
+                            case 0x33: overrideLabel = "#"; break;
+                            case 0x34: overrideLabel = "￥"; break;
+                            case 0x35: overrideLabel = "%"; break;
+                            case 0x36: overrideLabel = "……ˊ"; break;
+                            case 0x37: overrideLabel = "&˙"; break;
+                            case 0x38: overrideLabel = "*"; break;
+                            case 0x39: overrideLabel = "（"; break;
+                            case 0x30: overrideLabel = "）"; break;
+                            case 0xBD: overrideLabel = "——"; break;
+                            case 0xBB: overrideLabel = "+"; break;
+                            case 0xDB: overrideLabel = "『"; break;
+                            case 0xDD: overrideLabel = "』"; break;
+                            case 0xDC: overrideLabel = "、"; break;
+                            case 0xDE: overrideLabel = "”"; break;
+                            case 0xBA: overrideLabel = "："; break;
+                            case 0xBC: overrideLabel = "，"; break;
+                            case 0xBE: overrideLabel = "。"; break;
+                            case 0xBF: overrideLabel = "？"; break;
+                        }
+
+                        if (overrideLabel != null)
+                        {
+                            k.DisplayName = overrideLabel;
+                            k.TextColor = _themeSubColor;
+                            continue;
+                        }
+                    }
 
                     if (_isZhuyinMode && !symbols && !string.IsNullOrEmpty(k.Zhuyin) && !_temporaryEnglishMode)
                     {
                         k.DisplayName = k.Zhuyin;
-                        k.TextColor = "Orange";
+                        k.TextColor = _isDarkMode ? "Orange" : "#D2691E";
                     }
                     else
                     {
                         if (_temporaryEnglishMode && isAlpha)
                         {
-                            if (!_temporaryEnglishFirstUpperSent)
-                            {
-                                k.DisplayName = k.EnglishUpper;
-                                k.TextColor = "LightBlue";
-                            }
-                            else
-                            {
-                                k.DisplayName = k.English;
-                                k.TextColor = "White";
-                            }
+                            k.DisplayName = k.EnglishUpper;
+                            k.TextColor = _themeSubColor;
                         }
                         else
                         {
                             k.DisplayName = (isAlpha ? upper : symbols) ? k.EnglishUpper : k.English;
-                            k.TextColor = (isAlpha ? upper : symbols) ? "LightBlue" : "White";
+                            k.TextColor = (isAlpha ? upper : symbols) ? _themeSubColor : _themeTextColor;
                         }
                     }
-
                     if (k.VkCode == 0x14) k.TextColor = _isCapsLockActive ? "Cyan" : "White";
                     if (k.VkCode == 0x10) k.TextColor = _isShiftActive ? "Cyan" : "White";
                     if (k.VkCode == 0x11) k.TextColor = _isCtrlActive ? "Cyan" : "White";
@@ -739,9 +850,9 @@ namespace OSK
             r2.Add(new KeyModel { English = "i", EnglishUpper = "I", Zhuyin = "ㄛ", VkCode = 0x49 });
             r2.Add(new KeyModel { English = "o", EnglishUpper = "O", Zhuyin = "ㄟ", VkCode = 0x4F });
             r2.Add(new KeyModel { English = "p", EnglishUpper = "P", Zhuyin = "ㄣ", VkCode = 0x50 });
-            r2.Add(new KeyModel { English = "[", EnglishUpper = "{", Zhuyin = "", VkCode = 0xDB });
-            r2.Add(new KeyModel { English = "]", EnglishUpper = "}", Zhuyin = "", VkCode = 0xDD });
-            r2.Add(new KeyModel { English = "\\", EnglishUpper = "|", Zhuyin = "", VkCode = 0xDC, Width = 65 });
+            r2.Add(new KeyModel { English = "[", EnglishUpper = "{", Zhuyin = "「", VkCode = 0xDB });
+            r2.Add(new KeyModel { English = "]", EnglishUpper = "}", Zhuyin = "」", VkCode = 0xDD });
+            r2.Add(new KeyModel { English = "\\", EnglishUpper = "|", Zhuyin = "、", VkCode = 0xDC, Width = 65 });
             KeyRows.Add(r2);
 
             var r3 = new ObservableCollection<KeyModel>();
@@ -756,7 +867,7 @@ namespace OSK
             r3.Add(new KeyModel { English = "k", EnglishUpper = "K", Zhuyin = "ㄜ", VkCode = 0x4B });
             r3.Add(new KeyModel { English = "l", EnglishUpper = "L", Zhuyin = "ㄠ", VkCode = 0x4C });
             r3.Add(new KeyModel { English = ";", EnglishUpper = ":", Zhuyin = "ㄤ", VkCode = 0xBA });
-            r3.Add(new KeyModel { English = "'", EnglishUpper = "\"", Zhuyin = "", VkCode = 0xDE });
+            r3.Add(new KeyModel { English = "'", EnglishUpper = "\"", Zhuyin = "‘", VkCode = 0xDE });
             r3.Add(new KeyModel { English = "⏎", EnglishUpper = "Enter", Zhuyin = "送出", VkCode = 0x0D, Width = 98 });
             KeyRows.Add(r3);
 
@@ -772,7 +883,7 @@ namespace OSK
             r4.Add(new KeyModel { English = ",", EnglishUpper = "<", Zhuyin = "ㄝ", VkCode = 0xBC });
             r4.Add(new KeyModel { English = ".", EnglishUpper = ">", Zhuyin = "ㄡ", VkCode = 0xBE });
             r4.Add(new KeyModel { English = "/", EnglishUpper = "?", Zhuyin = "ㄥ", VkCode = 0xBF });
-            r4.Add(new KeyModel { English = "↑", EnglishUpper = "↑", Zhuyin = "", VkCode = 0x26 });
+            r4.Add(new KeyModel { English = "↑", EnglishUpper = "↑", Zhuyin = "上", VkCode = 0x26 });
             r4.Add(new KeyModel { English = "⌨", EnglishUpper = "Fn", Zhuyin = "", VkCode = FN_KEY_CODE });
             KeyRows.Add(r4);
 
@@ -782,9 +893,9 @@ namespace OSK
             r5.Add(new KeyModel { English = "⌥", EnglishUpper = "Alt", Zhuyin = "", VkCode = 0x12 });
             r5.Add(new KeyModel { English = "⎵", EnglishUpper = "Space", Zhuyin = "空白鍵", VkCode = 0x20, Width = 512 });
             r5.Add(new KeyModel { English = "Mode", EnglishUpper = "Mode", Zhuyin = "", VkCode = MODE_KEY_CODE });
-            r5.Add(new KeyModel { English = "←", EnglishUpper = "←", Zhuyin = "", VkCode = 0x25 });
-            r5.Add(new KeyModel { English = "↓", EnglishUpper = "↓", Zhuyin = "", VkCode = 0x28 });
-            r5.Add(new KeyModel { English = "→", EnglishUpper = "→", Zhuyin = "", VkCode = 0x27 });
+            r5.Add(new KeyModel { English = "←", EnglishUpper = "←", Zhuyin = "左", VkCode = 0x25 });
+            r5.Add(new KeyModel { English = "↓", EnglishUpper = "↓", Zhuyin = "下", VkCode = 0x28 });
+            r5.Add(new KeyModel { English = "→", EnglishUpper = "→", Zhuyin = "右", VkCode = 0x27 });
             KeyRows.Add(r5);
 
             UpdateDisplay();
@@ -805,13 +916,13 @@ namespace OSK
             }
         }
 
-        protected override void OnClosed(EventArgs e) { _notifyIcon?.Dispose(); base.OnClosed(e); }
+        protected override void OnClosed(EventArgs e) { _notifyIcon?.Dispose();_inputDetector?.Stop(); base.OnClosed(e); }
 
         protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
         {
             if (_virtualAltToggle)
             {
-                SendSimulatedKey(0x12, true); // Alt up
+                SendSimulatedKey(0x12, true);
                 _virtualAltToggle = false;
             }
             base.OnClosing(e);
@@ -877,13 +988,12 @@ namespace OSK
             }
             catch
             {
-                // Ctrl+Shift+Esc
-                SendSimulatedKey(0x11, false); // Ctrl down
-                SendSimulatedKey(0x10, false); // Shift down
-                SendSimulatedKey(0x1B, false); // Esc down
-                SendSimulatedKey(0x1B, true);  // Esc up
-                SendSimulatedKey(0x10, true);  // Shift up
-                SendSimulatedKey(0x11, true);  // Ctrl up
+                SendSimulatedKey(0x11, false);
+                SendSimulatedKey(0x10, false);
+                SendSimulatedKey(0x1B, false);
+                SendSimulatedKey(0x1B, true);
+                SendSimulatedKey(0x10, true);
+                SendSimulatedKey(0x11, true);
             }
         }
 
@@ -905,10 +1015,7 @@ namespace OSK
             {
                 System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("control", "/name Microsoft.UserAccounts") { UseShellExecute = true });
             }
-            catch
-            {
-                // fallback: no-op
-            }
+            catch { }
         }
     }
 
@@ -929,7 +1036,17 @@ namespace OSK
         private bool _isPressed = false;
         public bool IsPressed { get { return _isPressed; } set { _isPressed = value; OnPropertyChanged("IsPressed"); OnPropertyChanged("Background"); } }
 
-        public string Background => _isPressed ? "#666666" : "#333333";
+        private string _normalBackground = "#333333";
+        private string _pressedBackground = "#666666";
+
+        public void SetThemeColors(string normal, string pressed)
+        {
+            _normalBackground = normal;
+            _pressedBackground = pressed;
+            OnPropertyChanged("Background");
+        }
+
+        public string Background => _isPressed ? _pressedBackground : _normalBackground;
 
         public event PropertyChangedEventHandler? PropertyChanged;
         protected void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
