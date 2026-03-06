@@ -3,27 +3,10 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="OSK" Height="330" Width="1000" 
         Topmost="True" WindowStyle="None" AllowsTransparency="True" ShowInTaskbar="False"
-        Background="{Binding WindowBackground}" MouseLeftButtonDown="Window_MouseLeftButtonDown"
+        Background="{Binding WindowBackground}" 
+        Stylus.IsPressAndHoldEnabled="False" Stylus.IsFlicksEnabled="False" Stylus.IsTapFeedbackEnabled="False"
         ResizeMode="NoResize" Name="RootWindow">
     <Window.Resources>
-        <Style x:Key="KeyButtonStyle" TargetType="Button">
-            <Setter Property="Foreground" Value="{Binding TextColor}"/>
-            <Setter Property="HorizontalContentAlignment" Value="Center"/>
-            <Setter Property="VerticalContentAlignment" Value="Center"/>
-            <Setter Property="Padding" Value="2"/>
-            <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="BorderBrush" Value="#444"/>
-            <Setter Property="Focusable" Value="False"/>
-            <Setter Property="SnapsToDevicePixels" Value="True"/>
-            <Setter Property="ClipToBounds" Value="True"/>
-            <!-- 統一按鍵間距 -->
-            <Setter Property="Margin" Value="2,2"/>
-            <Style.Triggers>
-                <Trigger Property="IsMouseOver" Value="True">
-                    <Setter Property="Opacity" Value="0.8"/>
-                </Trigger>
-            </Style.Triggers>
-        </Style>
     </Window.Resources>
     <Grid>
         <!-- 右下角 Resize Grip：綁定 ResizeGripColor -->
@@ -36,68 +19,78 @@
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
-            <StackPanel Grid.Row="0" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,0,5" Panel.ZIndex="50">
-                <!-- 全鍵盤/精簡版面切換按鈕 -->
-                <Button Command="{Binding ToggleFullLayoutCommand}" 
-                        Content="{Binding FullLayoutIcon}"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Foreground="{Binding UiTextColor}"
-                        FontSize="16"
-                        Margin="0,0,5,0"
-                        ToolTip="切換 100% / 60% 版面" />
+            <!-- 頂部拖曳區 (限縮於此區域) -->
+            <Grid Grid.Row="0" Background="Transparent" MouseLeftButtonDown="Window_MouseLeftButtonDown">
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,0,5" Panel.ZIndex="50">
+                    <!-- 全鍵盤/精簡版面切換按鈕 -->
+                    <Button Command="{Binding ToggleFullLayoutCommand}" 
+                            Content="{Binding FullLayoutIcon}"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            Foreground="{Binding UiTextColor}"
+                            FontSize="16"
+                            Margin="0,0,5,0"
+                            ToolTip="切換 100% / 60% 版面" />
 
-                <!-- 動態/靜態版面切換按鈕 -->
-                <Button Command="{Binding ToggleLayoutCommand}" 
-                        Content="{Binding LayoutIcon}"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Foreground="{Binding UiTextColor}"
-                        FontSize="16"
-                        Margin="0,0,5,0"
-                        ToolTip="切換 動態/靜態 版面" />
-                        
-                <!-- 釘住切換按鈕 -->
-                <Button Command="{Binding TogglePinCommand}" 
-                        Content="{Binding PinIcon}"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Foreground="{Binding UiTextColor}"
-                        FontSize="16"
-                        Margin="0,0,5,0"
-                        ToolTip="釘住 / 取消釘住鍵盤 (開啟時不會隨焦點隱藏)" />
-                        
-                <!-- 主題切換按鈕：綁定 UiTextColor -->
-                <Button Command="{Binding ToggleThemeCommand}" 
-                        Content="{Binding ThemeIcon}"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Foreground="{Binding UiTextColor}"
-                        FontSize="16"
-                        Margin="0,0,10,0"
-                        ToolTip="切換 深色/淺色 模式" />
-                
-                <!-- 透明度文字：綁定 UiTextColor -->
-                <TextBlock Text="透明度: " Foreground="{Binding UiTextColor}" VerticalAlignment="Center"/>
-                
-                <!-- Slider：綁定 Foreground 來控制刻度顏色 (如果有顯示刻度)，主要依靠滑軌樣式 -->
-                <Slider x:Name="OpacitySlider" IsMoveToPointEnabled="True" 
-                        Value="{Binding Opacity, ElementName=RootWindow}" 
-                        Minimum="0.2" Maximum="1.0" Width="80" VerticalAlignment="Center" Focusable="true" Margin="5,0,10,0"
-                        Foreground="{Binding UiTextColor}"/>
-                
-                <!-- 最小化按鈕：文字綁定 UiTextColor，背景綁定 ControlBtnBackground -->
-                <Button Content=" 🗕 " Click="Minimize_Click" Width="30" Height="25" Margin="0,0,2,0" 
-                        Background="{Binding ControlBtnBackground}" 
-                        Foreground="{Binding UiTextColor}"
-                        FontWeight="Bold" BorderThickness="0"/>
-                
-                <!-- 關閉按鈕：維持紅色背景，文字固定白色，確保警示意味 -->
-                <Button Content=" ✕ " Click="Exit_Click" Width="30" Height="25" Margin="2,0,0,0" 
-                        Background="#993333" 
-                        Foreground="White"
-                        BorderThickness="0"/>
-            </StackPanel>
+                    <!-- 動態/靜態版面切換按鈕 -->
+                    <Button Command="{Binding ToggleLayoutCommand}" 
+                            Content="{Binding LayoutIcon}"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            Foreground="{Binding UiTextColor}"
+                            FontSize="16"
+                            Margin="0,0,5,0"
+                            ToolTip="切換 動態/靜態 版面" />
+                            
+                    <!-- 釘住切換按鈕 -->
+                    <Button Command="{Binding TogglePinCommand}" 
+                            Content="{Binding PinIcon}"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            Foreground="{Binding UiTextColor}"
+                            FontSize="16"
+                            Margin="0,0,5,0"
+                            ToolTip="釘住 / 取消釘住鍵盤 (開啟時不會隨焦點隱藏)" />
+                            
+                    <!-- 主題切換按鈕：綁定 UiTextColor -->
+                    <Button Command="{Binding ToggleThemeCommand}" 
+                            Content="{Binding ThemeIcon}"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            Foreground="{Binding UiTextColor}"
+                            FontSize="16"
+                            Margin="0,0,10,0"
+                            ToolTip="切換 深色/淺色 模式" />
+                    
+                    <!-- 透明度文字：綁定 UiTextColor -->
+                    <TextBlock Text="透明度: " Foreground="{Binding UiTextColor}" VerticalAlignment="Center"/>
+                    
+                    <!-- Slider：綁定 Foreground 來控制刻度顏色 (如果有顯示刻度)，主要依靠滑軌樣式 -->
+                    <Slider x:Name="OpacitySlider" IsMoveToPointEnabled="True" 
+                            Value="{Binding Opacity, ElementName=RootWindow}" 
+                            Minimum="0.2" Maximum="1.0" Width="80" VerticalAlignment="Center" Focusable="true" Margin="5,0,10,0"
+                            Foreground="{Binding UiTextColor}"/>
+                    
+                    <!-- 恢復預設尺寸按鈕 -->
+                    <Button Content=" ⟲ " Click="RestoreSize_Click" Width="30" Height="25" Margin="0,0,2,0" 
+                            Background="{Binding ControlBtnBackground}" 
+                            Foreground="{Binding UiTextColor}"
+                            FontWeight="Bold" BorderThickness="0"
+                            ToolTip="恢復預設尺寸"/>
+                            
+                    <!-- 最小化按鈕：文字綁定 UiTextColor，背景綁定 ControlBtnBackground -->
+                    <Button Content=" 🗕 " Click="Minimize_Click" Width="30" Height="25" Margin="0,0,2,0" 
+                            Background="{Binding ControlBtnBackground}" 
+                            Foreground="{Binding UiTextColor}"
+                            FontWeight="Bold" BorderThickness="0"/>
+                    
+                    <!-- 關閉按鈕：維持紅色背景，文字固定白色，確保警示意味 -->
+                    <Button Content=" ✕ " Click="Exit_Click" Width="30" Height="25" Margin="2,0,0,0" 
+                            Background="#993333" 
+                            Foreground="White"
+                            BorderThickness="0"/>
+                </StackPanel>
+            </Grid>
             <Viewbox Grid.Row="1" Stretch="Uniform" HorizontalAlignment="Stretch" VerticalAlignment="Bottom">
                 <ItemsControl Name="KeyBoardItemsControl">
                     <ItemsControl.ItemsPanel>
@@ -115,15 +108,29 @@
                                 </ItemsControl.ItemsPanel>
                                 <ItemsControl.ItemTemplate>
                                     <DataTemplate>
-                                        <Button Style="{StaticResource KeyButtonStyle}"
+                                        <Border BorderBrush="#444" BorderThickness="1" CornerRadius="3"
                                                 Background="{Binding Background}"
                                                 Width="{Binding Width}"
                                                 Height="{Binding Height}"
                                                 Margin="{Binding Margin}"
                                                 VerticalAlignment="Top"
                                                 Panel.ZIndex="10"
-                                                Command="{Binding DataContext.KeyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                                                CommandParameter="{Binding}">
+                                                Cursor="Hand"
+                                                MouseDown="KeyBorder_MouseDown"
+                                                MouseUp="KeyBorder_MouseUp"
+                                                MouseLeave="KeyBorder_MouseLeave"
+                                                TouchDown="KeyBorder_TouchDown"
+                                                TouchUp="KeyBorder_TouchUp"
+                                                TouchLeave="KeyBorder_TouchLeave">
+                                            <Border.Style>
+                                                <Style TargetType="Border">
+                                                    <Style.Triggers>
+                                                        <Trigger Property="IsMouseOver" Value="True">
+                                                            <Setter Property="Opacity" Value="0.85"/>
+                                                        </Trigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </Border.Style>
                                             <Grid>
                                                 <Viewbox x:Name="StaticLayout" Stretch="Uniform" StretchDirection="Both" Margin="2">
                                                     <Grid Width="50" Height="50">
@@ -153,7 +160,7 @@
                                                     <TextBlock Text="{Binding DisplayName}" Foreground="{Binding DynamicTextColor}" FontSize="24" FontFamily="Segoe UI" FontWeight="SemiBold" TextAlignment="Center" VerticalAlignment="Center" HorizontalAlignment="Center"/>
                                                 </Viewbox>
                                             </Grid>
-                                        </Button>
+                                        </Border>
                                         <DataTemplate.Triggers>
                                             <DataTrigger Binding="{Binding DataContext.IsDynamicLayout, RelativeSource={RelativeSource AncestorType=Window}}" Value="True">
                                                 <Setter TargetName="StaticLayout" Property="Visibility" Value="Collapsed" />

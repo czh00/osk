@@ -836,6 +836,39 @@ namespace OSK
             UpdateDisplay();
         }
 
+        private void KeyBorder_MouseDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
+        {
+            if (e.StylusDevice != null) return; // 忽略被 WPF 轉換的觸控假滑鼠事件
+            if (sender is System.Windows.Controls.Border b) b.Opacity = 0.5;
+            if ((sender as FrameworkElement)?.DataContext is KeyModel key) { e.Handled = true; OnKeyClick(key); }
+        }
+
+        private void KeyBorder_MouseUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
+        {
+            if (sender is System.Windows.Controls.Border b) b.ClearValue(UIElement.OpacityProperty);
+        }
+
+        private void KeyBorder_MouseLeave(object sender, System.Windows.Input.MouseEventArgs e)
+        {
+            if (sender is System.Windows.Controls.Border b) b.ClearValue(UIElement.OpacityProperty);
+        }
+
+        private void KeyBorder_TouchDown(object sender, System.Windows.Input.TouchEventArgs e)
+        {
+            if (sender is System.Windows.Controls.Border b) b.Opacity = 0.5;
+            if ((sender as FrameworkElement)?.DataContext is KeyModel key) { e.Handled = true; OnKeyClick(key); }
+        }
+
+        private void KeyBorder_TouchUp(object sender, System.Windows.Input.TouchEventArgs e)
+        {
+            if (sender is System.Windows.Controls.Border b) b.ClearValue(UIElement.OpacityProperty);
+        }
+
+        private void KeyBorder_TouchLeave(object sender, System.Windows.Input.TouchEventArgs e)
+        {
+            if (sender is System.Windows.Controls.Border b) b.ClearValue(UIElement.OpacityProperty);
+        }
+
         private void UpdateDisplay()
         {
             bool upper = _isCapsLockActive ^ _isShiftActive;
@@ -1239,6 +1272,17 @@ namespace OSK
 
         private void Minimize_Click(object sender, RoutedEventArgs e) => this.Hide();
         private void Exit_Click(object sender, RoutedEventArgs e) => System.Windows.Application.Current.Shutdown();
+
+        private void RestoreSize_Click(object sender, RoutedEventArgs e)
+        {
+            this.Width = 1000;
+            double ratio = IsFullLayout ? 0.23 : 0.31;
+            double minH = Math.Max(this.Width * ratio + 45, 120);
+            this.MinHeight = minH;
+            this.MaxHeight = minH;
+            this.Height = minH;
+        }
+
         private void Window_MouseLeftButtonDown(object sender, MouseButtonEventArgs e) { if (!_isResizing) this.DragMove(); }
         private void Resize_Init(object sender, MouseButtonEventArgs e) { _isResizing = true; Mouse.Capture((UIElement)sender); }
         private void Resize_End(object sender, MouseButtonEventArgs e) { _isResizing = false; Mouse.Capture(null); }
