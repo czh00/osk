@@ -6,16 +6,14 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
-    <Version>1.0.5</Version>
+    <Version>1.1.0</Version>
     <AssemblyVersion>$(Version)</AssemblyVersion>
     <FileVersion>$(Version)</FileVersion>
     <Title>OSK</Title>
 
-    <!-- 圖示與 apphost（必要以在 exe 上顯示 icon） -->
     <UseAppHost>true</UseAppHost>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
 
-    <!-- 發佈設置（可依需求調整 SelfContained/PublishSingleFile） -->
     <SelfContained>false</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
     <PublishReadyToRun>true</PublishReadyToRun>
@@ -40,7 +38,6 @@
     </EmbeddedResource>
   </ItemGroup>
 
-  <!-- 確保 icon 檔包含在專案中 -->
   <ItemGroup>
     <None Include="Assets\app.ico" Pack="true" Visible="true" />
   </ItemGroup>
