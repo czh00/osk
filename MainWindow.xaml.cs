@@ -12,7 +12,9 @@ using System.Linq;
 using System.Windows.Threading;
 using System.Threading;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Reflection;
+using System.IO;
 using Microsoft.Win32;
 
 namespace OSK
@@ -112,15 +114,53 @@ namespace OSK
         [DllImport("imm32.dll")] private static extern bool ImmReleaseContext(IntPtr hWnd, IntPtr hIMC);
         [DllImport("imm32.dll")] private static extern IntPtr ImmGetDefaultIMEWnd(IntPtr hWnd);
         [DllImport("imm32.dll")] private static extern bool ImmSetConversionStatus(IntPtr hIMC, uint dwConversion, uint dwSentence);
+        [DllImport("imm32.dll")] private static extern bool ImmGetOpenStatus(IntPtr hIMC);
+        [DllImport("imm32.dll")] private static extern bool ImmSetOpenStatus(IntPtr hIMC, bool fOpen);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        private const uint WM_IME_CONTROL = 0x0283;
+        private const int IMC_GETCONVERSIONMODE = 0x0001;
+        private const int IMC_GETOPENSTATUS = 0x0005;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WINDOWPOS
+        {
+            public IntPtr hwnd;
+            public IntPtr hwndInsertAfter;
+            public int x;
+            public int y;
+            public int cx;
+            public int cy;
+            public uint flags;
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern bool SetProcessWorkingSetSize(IntPtr process, int minimumWorkingSetSize, int maximumWorkingSetSize);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+        private const int DWMWA_TRANSITIONS_FORCEDISABLED = 3;
+        private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+        private const int DWMWCP_ROUND = 2;
 
         #endregion
 
         #region 常數與委派
         private const int GWL_EXSTYLE = -20;
         private const int WS_EX_NOACTIVATE = 0x08000000;
+        private const int WM_WINDOWPOSCHANGING = 0x0046;
+        private const int WM_NCHITTEST = 0x0084;
+        private const int HTCLIENT = 1;
+
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOSIZE = 0x0001;
         private const uint IME_CMODE_NATIVE = 0x0001;
         private const byte MODE_KEY_CODE = 0xFF;
         private const byte FN_KEY_CODE = 0xFE;
+        private const byte CAD_KEY_CODE = 0xFD;
         #endregion
 
         #region 欄位
@@ -134,9 +174,22 @@ namespace OSK
         public ICommand? TogglePinCommand { get; set; }
         public ICommand? ToggleLayoutCommand { get; set; }
         public ICommand? ToggleFullLayoutCommand { get; set; }
+        public ICommand? ToggleEditModeCommand { get; set; }
 
         private bool _isPinned = true;
         public string PinIcon { get { return _isPinned ? "📍" : "📌"; } }
+
+        private bool _isEditMode = false;
+        public bool IsEditMode { get { return _isEditMode; } set { _isEditMode = value; OnPropertyChanged("IsEditMode"); OnPropertyChanged("SettingsBtnColor"); } }
+        public string SettingsBtnColor { get { return _isEditMode ? _themeActiveColor : UiTextColor; } }
+
+        // Drag and Drop state
+        private bool _isManualDragging = false;
+        private System.Windows.Point _dragStartPoint;
+        private KeyModel? _draggedKey;
+        private System.Windows.Controls.Border? _draggedBorder;
+        private System.Windows.Shapes.Rectangle? _dragGhost;
+        private System.Windows.Point _ghostOffset;
 
         private bool _isDynamicLayout = true;
         public bool IsDynamicLayout { get { return _isDynamicLayout; } set { _isDynamicLayout = value; OnPropertyChanged("IsDynamicLayout"); } }
@@ -160,7 +213,14 @@ namespace OSK
         private bool _isWinActive = false;
 
         private bool _lastPhysicalShiftDown = false;
+        private DateTime _physShiftDownTime = DateTime.MinValue;
         private bool _isNumLockActive = false;
+        private bool _isTouchDraggingWindow = false;
+        private System.Windows.Point _touchDragStartPoint;
+
+        private string _currentAppInfo = "OSK (讀取中...)";
+        public string CurrentAppInfo { get { return _currentAppInfo; } set { _currentAppInfo = value; OnPropertyChanged("CurrentAppInfo"); } }
+        private string _lastLoggedAppInfo = "";
 
         // 本地虛擬 modifier
         private bool _virtualShiftToggle = false;
@@ -271,6 +331,9 @@ namespace OSK
         };
 
         private bool _isResizing = false;
+        private bool _needsInitialCentering = false;
+
+        private string _iniFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "osk.ini");
         #endregion
 
         // 將特定按鍵加入到 User32 SendInput 結構清單中
@@ -351,7 +414,7 @@ namespace OSK
             if (opacitySlider != null)
             {
                 try { opacitySlider.IsMoveToPointEnabled = true; } catch { }
-                opacitySlider.PreviewMouseLeftButtonDown += OpacitySlider_PreviewMouseLeftButtonDown;
+                opacitySlider.ValueChanged += (s, e) => { this.Opacity = e.NewValue; };
             }
 
             KeyCommand = new RelayCommand<KeyModel>(OnKeyClick);
@@ -359,12 +422,21 @@ namespace OSK
             TogglePinCommand = new RelayCommand<object>(TogglePin);
             ToggleLayoutCommand = new RelayCommand<object>(ToggleLayout);
             ToggleFullLayoutCommand = new RelayCommand<object>(ToggleFullLayout);
+            ToggleEditModeCommand = new RelayCommand<object>(ToggleEditMode);
 
             SetupKeyboard();
-            KeyBoardItemsControl.ItemsSource = KeyRows;
 
-            // 初始化主題 (偵測系統)
-            DetectSystemTheme();
+            // 如果沒有 INI 設定檔，首次啟動應預設置中並靠下
+            if (!File.Exists(_iniFilePath))
+            {
+                _needsInitialCentering = true;
+            }
+
+            // 讀取 INI 設定 (包含位置與自訂按鍵排列)
+            LoadSettings();
+
+            KeyBoardItemsControl.ItemsSource = null;
+            KeyBoardItemsControl.ItemsSource = KeyRows;
 
             System.Drawing.Icon? trayIcon = null;
             try
@@ -390,7 +462,13 @@ namespace OSK
             if (trayIcon == null) trayIcon = SystemIcons.Application;
 
             _notifyIcon = new System.Windows.Forms.NotifyIcon { Icon = trayIcon, Visible = true, Text = "OSK" };
-            _notifyIcon.Click += (s, e) => ToggleVisibility();
+            _notifyIcon.MouseClick += (s, e) =>
+            {
+                if (e.Button == System.Windows.Forms.MouseButtons.Left)
+                {
+                    ToggleVisibility();
+                }
+            };
             var menu = new System.Windows.Forms.ContextMenuStrip();
             menu.Items.Add("結束", null, (s, e) => System.Windows.Application.Current.Shutdown());
             _notifyIcon.ContextMenuStrip = menu;
@@ -459,13 +537,13 @@ namespace OSK
         private void ToggleFullLayout(object? parameter)
         {
             IsFullLayout = !IsFullLayout;
-            FullLayoutIcon = IsFullLayout ? "⌨" : "📱";
+            FullLayoutIcon = IsFullLayout ? "📱" : "⌨";
 
             KeyRows.Clear();
             if (IsFullLayout)
             {
                 SetupFullKeyboard();
-                double targetH = Math.Max(this.Width * 0.23 + 45, 120);
+                double targetH = Math.Max(this.Width * 0.23 + 5, 80);
                 this.MinHeight = targetH;
                 this.MaxHeight = targetH;
                 this.Height = targetH;
@@ -473,12 +551,25 @@ namespace OSK
             else
             {
                 SetupKeyboard();
-                double targetH = Math.Max(this.Width * 0.31 + 45, 120);
+                double targetH = Math.Max(this.Width * 0.31 + 5, 80);
                 this.MinHeight = targetH;
                 this.MaxHeight = targetH;
                 this.Height = targetH;
             }
+
+            // 切換版面後嘗試套用自訂排列
+            ApplyCustomLayout();
+
             UpdateDisplay();
+        }
+
+        private void ToggleEditMode(object? parameter)
+        {
+            IsEditMode = !IsEditMode;
+            if (!IsEditMode)
+            {
+                SaveSettings(); // 離開編輯模式時儲存
+            }
         }
 
         private void ApplyTheme(bool isDark)
@@ -487,14 +578,14 @@ namespace OSK
 
             if (_isDarkMode)
             {
-                // 深色模式
+                // 深色模式：最高不透明度為純黑
                 ThemeIcon = "☀";
-                WindowBackground = "#1E1E1E";
+                WindowBackground = "#FF000000";
 
                 // UI 介面顏色
                 UiTextColor = "White";
                 ResizeGripColor = "#AAAAAA";
-                ControlBtnBackground = "#333333";
+                ControlBtnBackground = "#44333333";
 
                 // 按鍵顏色
                 _themeTextColor = "White";
@@ -505,14 +596,14 @@ namespace OSK
             }
             else
             {
-                // 淺色模式
+                // 淺色模式：最高不透明度為純白/淺灰
                 ThemeIcon = "🌙";
-                WindowBackground = "#F0F0F0";
+                WindowBackground = "#FFF0F0F0";
 
                 // UI 介面顏色
                 UiTextColor = "#333333";
                 ResizeGripColor = "#666666";
-                ControlBtnBackground = "#DDDDDD";
+                ControlBtnBackground = "#44DDDDDD";
 
                 // 按鍵顏色
                 _themeTextColor = "#333333";
@@ -527,9 +618,9 @@ namespace OSK
                 foreach (var k in row)
                 {
                     if (_isDarkMode)
-                        k.SetThemeColors("#333333", "#666666", "White", "#1E90FF", "#32CD32", "Orange", "LightSkyBlue");
+                        k.SetThemeColors("#22FFFFFF", "#44FFFFFF", "White", "#1E90FF", "#32CD32", "Orange", "LightSkyBlue");
                     else
-                        k.SetThemeColors("#FFFFFF", "#DDDDDD", "#333333", "#0078D7", "#2E8B57", "#D2691E", "#00A2E8");
+                        k.SetThemeColors("#88FFFFFF", "#BBFFFFFF", "#333333", "#0078D7", "#2E8B57", "#D2691E", "#00A2E8");
                 }
             }
             UpdateDisplay();
@@ -541,6 +632,7 @@ namespace OSK
 
         private void OnGlobalPreviewMouseDown(object sender, MouseButtonEventArgs e)
         {
+            if (IsEditMode) return;
             if ((e.OriginalSource as FrameworkElement)?.DataContext is KeyModel key)
             {
                 if (key.VkCode == MODE_KEY_CODE)
@@ -572,7 +664,49 @@ namespace OSK
 
         #endregion
 
-        private void MainWindow_Loaded(object? sender, RoutedEventArgs e)
+        private bool _isClamping = false;
+        private void ClampToScreen()
+        {
+            if (_isClamping) return;
+            _isClamping = true;
+            try
+            {
+                var cursorPos = System.Windows.Forms.Cursor.Position;
+                var screen = System.Windows.Forms.Screen.FromPoint(cursorPos);
+                var wa = screen.WorkingArea;
+
+                var source = PresentationSource.FromVisual(this);
+                Matrix transform = Matrix.Identity;
+                if (source?.CompositionTarget != null) transform = source.CompositionTarget.TransformFromDevice;
+
+                var topLeft = transform.Transform(new System.Windows.Point(wa.Left, wa.Top));
+                var bottomRight = transform.Transform(new System.Windows.Point(wa.Right, wa.Bottom));
+                double waLeft = topLeft.X;
+                double waTop = topLeft.Y;
+                double waWidth = Math.Max(0, bottomRight.X - topLeft.X);
+                double waHeight = Math.Max(0, bottomRight.Y - topLeft.Y);
+
+                double w = this.ActualWidth > 0 ? this.ActualWidth : (double.IsNaN(this.Width) ? 1000 : this.Width);
+                double h = this.ActualHeight > 0 ? this.ActualHeight : (double.IsNaN(this.Height) ? 360 : this.Height);
+
+                double newLeft = this.Left;
+                double newTop = this.Top;
+
+                if (newLeft < waLeft) newLeft = waLeft;
+                if (newLeft + w > waLeft + waWidth) newLeft = waLeft + waWidth - w;
+                if (newTop < waTop) newTop = waTop;
+                if (newTop + h > waTop + waHeight) newTop = waTop + waHeight - h;
+
+                if (this.Left != newLeft) this.Left = newLeft;
+                if (this.Top != newTop) this.Top = newTop;
+            }
+            finally
+            {
+                _isClamping = false;
+            }
+        }
+
+        private void CenterWindow()
         {
             var cursorPos = System.Windows.Forms.Cursor.Position;
             var screen = System.Windows.Forms.Screen.FromPoint(cursorPos);
@@ -595,10 +729,39 @@ namespace OSK
             this.Left = waLeft + (waWidth - w) / 2.0;
             this.Top = waTop + (waHeight - h);
 
-            if (this.Left < waLeft) this.Left = waLeft;
-            if (this.Left + w > waLeft + waWidth) this.Left = waLeft + waWidth - w;
-            if (this.Top < waTop) this.Top = waTop;
-            if (this.Top + h > waTop + waHeight) this.Top = waTop + waHeight - h;
+            ClampToScreen();
+        }
+
+        private void ReduceMemoryUsage()
+        {
+            try
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                if (Environment.OSVersion.Platform == PlatformID.Win32NT)
+                {
+                    SetProcessWorkingSetSize(System.Diagnostics.Process.GetCurrentProcess().Handle, -1, -1);
+                }
+            }
+            catch { }
+        }
+
+        private void MainWindow_Loaded(object? sender, RoutedEventArgs e)
+        {
+            if (_needsInitialCentering)
+            {
+                CenterWindow();
+                _needsInitialCentering = false;
+            }
+
+            // Initial positioning handle
+            ClampToScreen();
+
+            // Release memory after initialization
+            Task.Delay(1000).ContinueWith(_ =>
+            {
+                this.Dispatcher.Invoke(() => ReduceMemoryUsage());
+            });
         }
 
         private void VisualSyncTimer_Tick(object? sender, EventArgs e)
@@ -608,19 +771,27 @@ namespace OSK
             bool physAlt = (GetAsyncKeyState(0x12) & 0x8000) != 0;
             bool physWin = (GetAsyncKeyState(0x5B) & 0x8000) != 0;
 
-            if (physShift && !_lastPhysicalShiftDown)
+            if (physShift)
             {
-                if (_isZhuyinMode)
+                if (!_lastPhysicalShiftDown)
                 {
-                    _temporaryEnglishMode = true;
-                    UpdateDisplay();
+                    _physShiftDownTime = DateTime.Now;
                 }
+            }
+            else
+            {
+                _physShiftDownTime = DateTime.MinValue;
             }
 
             _lastPhysicalShiftDown = physShift;
 
             _isCapsLockActive = (GetKeyState(0x14) & 0x0001) != 0;
-            _isShiftActive = physShift || _virtualShiftToggle;
+
+            // 實體 Shift 視覺延遲邏輯：
+            // 如果按住時間超過 500ms，才視為「啟動 Shift 版面預覽」
+            // 這樣在短點按切換輸入法時，版面就不會跳動閃爍
+            bool isPhysShiftLongPressed = physShift && (DateTime.Now - _physShiftDownTime).TotalMilliseconds > 200;
+            _isShiftActive = isPhysShiftLongPressed || _virtualShiftToggle;
             _isCtrlActive = physCtrl || _virtualCtrlToggle;
             _isAltActive = physAlt || _virtualAltToggle;
             _isWinActive = physWin || _virtualWinToggle;
@@ -660,6 +831,260 @@ namespace OSK
             IntPtr foregroundHwnd = GetForegroundWindow();
             if (foregroundHwnd == IntPtr.Zero) return;
 
+            uint threadId = GetWindowThreadProcessId(foregroundHwnd, out uint pid);
+            string processName = "Unknown";
+            try
+            {
+                var proc = System.Diagnostics.Process.GetProcessById((int)pid);
+                processName = proc.ProcessName;
+            }
+            catch { }
+
+            GUITHREADINFO guiInfo = new GUITHREADINFO();
+            guiInfo.cbSize = Marshal.SizeOf(guiInfo);
+
+            IntPtr targetHwnd = foregroundHwnd;
+            if (GetGUIThreadInfo(threadId, ref guiInfo))
+            {
+                if (guiInfo.hwndFocus != IntPtr.Zero) targetHwnd = guiInfo.hwndFocus;
+            }
+
+            IntPtr imeWnd = ImmGetDefaultIMEWnd(targetHwnd);
+            IntPtr hIMC = ImmGetContext(imeWnd != IntPtr.Zero ? imeWnd : targetHwnd);
+
+            bool isChineseMode = _isZhuyinMode;
+
+            if (DateTime.UtcNow < _ignoreImeSyncUntil)
+            {
+                if (hIMC != IntPtr.Zero) ImmReleaseContext(targetHwnd, hIMC);
+                UpdateAppInfo(processName, isChineseMode);
+                return;
+            }
+
+            bool isChinese = false;
+            bool statusRead = false;
+
+            // 優先使用 WM_IME_CONTROL 直接詢問 IME 視窗 (能支援 Weasel 小狼毫等 TSF，此時 hIMC 可能為 Zero)
+            if (imeWnd != IntPtr.Zero)
+            {
+                IntPtr resOpen = SendMessage(imeWnd, WM_IME_CONTROL, (IntPtr)IMC_GETOPENSTATUS, IntPtr.Zero);
+                IntPtr resConv = SendMessage(imeWnd, WM_IME_CONTROL, (IntPtr)IMC_GETCONVERSIONMODE, IntPtr.Zero);
+
+                bool isOpen = resOpen.ToInt32() != 0;
+                bool isNative = (resConv.ToInt32() & IME_CMODE_NATIVE) != 0;
+
+                isChinese = isOpen && isNative;
+                statusRead = true;
+            }
+            // 若沒有 imeWnd 但有傳統 hIMC，則退回使用舊版 API (例如舊應用)
+            else if (hIMC != IntPtr.Zero)
+            {
+                bool isOpen = ImmGetOpenStatus(hIMC);
+                if (ImmGetConversionStatus(hIMC, out uint conv, out uint sentence))
+                {
+                    bool isNative = (conv & IME_CMODE_NATIVE) != 0;
+                    isChinese = isOpen && isNative;
+                    statusRead = true;
+                }
+            }
+
+            if (statusRead)
+            {
+                isChineseMode = isChinese;
+                if (_isZhuyinMode != isChinese)
+                {
+                    _isZhuyinMode = isChinese;
+                    _localPreviewToggle = false;
+                    _temporaryEnglishMode = false;
+                    UpdateDisplay();
+                }
+            }
+
+            if (hIMC != IntPtr.Zero)
+            {
+                ImmReleaseContext(targetHwnd, hIMC);
+            }
+
+            UpdateAppInfo(processName, isChineseMode);
+        }
+
+        private string GetClipboardTextSafe()
+        {
+            try
+            {
+                if (System.Windows.Clipboard.ContainsImage())
+                {
+                    return "🖼️ 圖片";
+                }
+                else if (System.Windows.Clipboard.ContainsFileDropList())
+                {
+                    var files = System.Windows.Clipboard.GetFileDropList();
+                    if (files != null && files.Count > 0)
+                    {
+                        string fileName = System.IO.Path.GetFileName(files[0]) ?? "";
+                        if (files.Count > 1)
+                        {
+                            return $"📁 {fileName} 等 {files.Count} 個檔案";
+                        }
+                        return $"📁 {fileName}";
+                    }
+                }
+                else if (System.Windows.Clipboard.ContainsText())
+                {
+                    string text = System.Windows.Clipboard.GetText();
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        text = text.Replace("\r", "").Replace("\n", " ").Replace("\t", " ").Trim();
+                        if (text.Length > 10)
+                        {
+                            text = text.Substring(0, 10) + "...";
+                        }
+                        return text;
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore clipboard access exceptions
+            }
+            return "";
+        }
+
+        private void UpdateAppInfo(string processName, bool isZhuyin)
+        {
+            string status = isZhuyin ? "注音" : "英文";
+            string clip = GetClipboardTextSafe();
+            string newInfo = $"{processName} - {status}";
+            if (!string.IsNullOrEmpty(clip))
+            {
+                newInfo += $" | 📋 {clip}";
+            }
+
+            if (_lastLoggedAppInfo != newInfo)
+            {
+                _lastLoggedAppInfo = newInfo;
+                if (System.Windows.Application.Current != null && System.Windows.Application.Current.Dispatcher != null)
+                {
+                    System.Windows.Application.Current.Dispatcher.InvokeAsync(() => { CurrentAppInfo = newInfo; });
+                }
+            }
+        }
+
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            var helper = new WindowInteropHelper(this);
+            SetWindowLong(helper.Handle, GWL_EXSTYLE, GetWindowLong(helper.Handle, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
+
+            // 強制關閉 Windows 11 預設的視窗轉場效果 (例如觸控時的 Cloud White Shrink / Snap 預覽)
+            int disableTransitions = 1;
+            DwmSetWindowAttribute(helper.Handle, DWMWA_TRANSITIONS_FORCEDISABLED, ref disableTransitions, sizeof(int));
+
+            // 嘗試保留圓角 (如果系統支援)
+            int cornerPref = DWMWCP_ROUND;
+            DwmSetWindowAttribute(helper.Handle, DWMWA_WINDOW_CORNER_PREFERENCE, ref cornerPref, sizeof(int));
+
+            HwndSource.FromHwnd(helper.Handle).AddHook(WndProc);
+        }
+
+        private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == WM_NCHITTEST)
+            {
+                if (_isTouchDraggingWindow)
+                {
+                    handled = true;
+                    return (IntPtr)HTCLIENT;
+                }
+            }
+
+            if (msg == _msgShowOsk) { ToggleVisibility(); handled = true; }
+            if (msg == WM_WINDOWPOSCHANGING)
+            {
+                WINDOWPOS wp = Marshal.PtrToStructure<WINDOWPOS>(lParam);
+                if ((wp.flags & SWP_NOMOVE) == 0 || (wp.flags & SWP_NOSIZE) == 0)
+                {
+                    double dpiX = 96.0, dpiY = 96.0;
+                    var source = PresentationSource.FromVisual(this);
+                    if (source?.CompositionTarget != null)
+                    {
+                        Matrix m = source.CompositionTarget.TransformToDevice;
+                        dpiX = 96.0 * m.M11;
+                        dpiY = 96.0 * m.M22;
+                    }
+
+                    int w = (wp.flags & SWP_NOSIZE) == 0 ? wp.cx : (int)(this.ActualWidth * dpiX / 96.0);
+                    int h = (wp.flags & SWP_NOSIZE) == 0 ? wp.cy : (int)(this.ActualHeight * dpiY / 96.0);
+
+                    if (w <= 0) w = (int)(1000 * dpiX / 96.0);
+                    if (h <= 0) h = (int)(330 * dpiY / 96.0);
+
+                    int curX = (wp.flags & SWP_NOMOVE) == 0 ? wp.x : (int)(this.Left * dpiX / 96.0);
+                    int curY = (wp.flags & SWP_NOMOVE) == 0 ? wp.y : (int)(this.Top * dpiY / 96.0);
+
+                    // Grab the monitor where this bounds rectangle would land
+                    RECT rect = new RECT { left = curX, top = curY, right = curX + w, bottom = curY + h };
+                    IntPtr hMonitor = MonitorFromRect(ref rect, MONITOR_DEFAULTTONEAREST);
+                    if (hMonitor != IntPtr.Zero)
+                    {
+                        MONITORINFOEX mInfo = new MONITORINFOEX();
+                        mInfo.cbSize = Marshal.SizeOf(mInfo);
+                        if (GetMonitorInfo(hMonitor, ref mInfo))
+                        {
+                            var wa = mInfo.rcWork;
+
+                            int newX = curX;
+                            int newY = curY;
+
+                            if (newX < wa.left) newX = wa.left;
+                            if (newX + w > wa.right) newX = wa.right - w;
+
+                            if (newY < wa.top) newY = wa.top;
+                            // Make sure we check against wa.top again if wa.bottom - wa.top is actually smaller than the window (edge case)
+                            if (newY + h > wa.bottom) newY = Math.Max(wa.top, wa.bottom - h);
+
+                            if (newX != wp.x || newY != wp.y)
+                            {
+                                wp.x = newX;
+                                wp.y = newY;
+                                Marshal.StructureToPtr(wp, lParam, true);
+                                handled = true;
+                            }
+                        }
+                    }
+                }
+            }
+            return IntPtr.Zero;
+        }
+
+        // Win32 API for native Monitor matching
+        [DllImport("user32.dll")] private static extern IntPtr MonitorFromRect([In] ref RECT lprc, uint dwFlags);
+        [DllImport("user32.dll", CharSet = CharSet.Auto)] private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
+        private const uint MONITOR_DEFAULTTONEAREST = 2;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT { public int left; public int top; public int right; public int bottom; }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private struct MONITORINFOEX
+        {
+            public int cbSize;
+            public RECT rcMonitor;
+            public RECT rcWork;
+            public int dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string szDevice;
+        }
+
+        private void ToggleImeStatus(bool targetIsChinese)
+        {
+            IntPtr foregroundHwnd = GetForegroundWindow();
+            if (foregroundHwnd == IntPtr.Zero)
+            {
+                FallbackImeToggle();
+                return;
+            }
+
             uint threadId = GetWindowThreadProcessId(foregroundHwnd, out _);
             GUITHREADINFO guiInfo = new GUITHREADINFO();
             guiInfo.cbSize = Marshal.SizeOf(guiInfo);
@@ -675,49 +1100,45 @@ namespace OSK
 
             if (hIMC != IntPtr.Zero)
             {
-                if (DateTime.UtcNow < _ignoreImeSyncUntil)
-                {
-                    ImmReleaseContext(targetHwnd, hIMC);
-                    return;
-                }
-
                 if (ImmGetConversionStatus(hIMC, out uint conv, out uint sentence))
                 {
-                    bool isChinese = (conv & IME_CMODE_NATIVE) != 0;
-                    if (_isZhuyinMode != isChinese)
-                    {
-                        _isZhuyinMode = isChinese;
-                        _localPreviewToggle = false;
-                        UpdateDisplay();
-                    }
+                    if (targetIsChinese) conv |= IME_CMODE_NATIVE;
+                    else conv &= ~IME_CMODE_NATIVE;
+
+                    ImmSetConversionStatus(hIMC, conv, sentence);
                 }
                 ImmReleaseContext(targetHwnd, hIMC);
             }
+            else
+            {
+                FallbackImeToggle();
+            }
         }
 
-        protected override void OnSourceInitialized(EventArgs e)
+        private void FallbackImeToggle()
         {
-            base.OnSourceInitialized(e);
-            var helper = new WindowInteropHelper(this);
-            SetWindowLong(helper.Handle, GWL_EXSTYLE, GetWindowLong(helper.Handle, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
-            HwndSource.FromHwnd(helper.Handle).AddHook(WndProc);
-        }
-
-        private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
-        {
-            if (msg == _msgShowOsk) { ToggleVisibility(); handled = true; }
-            return IntPtr.Zero;
+            var inputs = new List<INPUT>();
+            // Fallback utilizing proper ScanCodes so the IME respects it
+            var inputDown = new INPUT { type = INPUT_KEYBOARD, u = new InputUnion { ki = new KEYBDINPUT { wVk = 0xA0, wScan = 0x2A, dwFlags = 0x0008, time = 0, dwExtraInfo = IntPtr.Zero } } };
+            var inputUp = new INPUT { type = INPUT_KEYBOARD, u = new InputUnion { ki = new KEYBDINPUT { wVk = 0xA0, wScan = 0x2A, dwFlags = 0x0008 | KEYEVENTF_KEYUP, time = 0, dwExtraInfo = IntPtr.Zero } } };
+            inputs.Add(inputDown);
+            inputs.Add(inputUp);
+            SendInput((uint)inputs.Count, inputs.ToArray(), INPUT.Size);
         }
 
         private void ToggleVisibility()
         {
-            if (this.Visibility == Visibility.Visible) this.Hide();
+            if (this.Visibility == Visibility.Visible)
+            {
+                this.Hide();
+                Task.Delay(500).ContinueWith(_ => this.Dispatcher.Invoke(() => ReduceMemoryUsage()));
+            }
             else { this.Show(); }
         }
 
         private void OnKeyClick(KeyModel? key)
         {
-            if (key == null) return;
+            if (key == null || IsEditMode) return; // 編輯模式下停用快速點擊功能
 
             if (key.VkCode == MODE_KEY_CODE)
             {
@@ -732,11 +1153,19 @@ namespace OSK
                     return;
                 }
 
-                SendSimulatedKey(0x10, false); Thread.Sleep(5); SendSimulatedKey(0x10, true);
+                ToggleImeStatus(!_isZhuyinMode);
                 _isZhuyinMode = !_isZhuyinMode;
                 _ignoreImeSyncUntil = DateTime.UtcNow.AddMilliseconds(300);
                 _temporaryEnglishMode = false;
                 ResetVirtualModifiers();
+                UpdateDisplay();
+                return;
+            }
+
+            if (key.VkCode == CAD_KEY_CODE)
+            {
+                ShowSecurityMenu();
+                if (!_temporaryEnglishMode) ResetVirtualModifiers();
                 UpdateDisplay();
                 return;
             }
@@ -836,45 +1265,382 @@ namespace OSK
             UpdateDisplay();
         }
 
+        private void ApplyJellyAnimation(UIElement element, double toScaleX, double toScaleY, double durationMs, bool elastic)
+        {
+            var transform = element.RenderTransform as ScaleTransform;
+            if (transform == null || element.RenderTransformOrigin.X != 0.5)
+            {
+                transform = new ScaleTransform(1, 1);
+                element.RenderTransformOrigin = new System.Windows.Point(0.5, 0.5);
+                element.RenderTransform = transform;
+            }
+
+            transform.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+            transform.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+
+            var animX = new DoubleAnimation { To = toScaleX, Duration = TimeSpan.FromMilliseconds(durationMs) };
+            var animY = new DoubleAnimation { To = toScaleY, Duration = TimeSpan.FromMilliseconds(durationMs) };
+
+            if (elastic)
+            {
+                // 超級 Q 彈的果凍回彈 (彈簧更軟、震盪更多次)
+                animX.EasingFunction = new ElasticEase { EasingMode = EasingMode.EaseOut, Oscillations = 4, Springiness = 3 };
+                animY.EasingFunction = new ElasticEase { EasingMode = EasingMode.EaseOut, Oscillations = 4, Springiness = 3 };
+            }
+            else
+            {
+                // 瞬間壓扁的緩動
+                animX.EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut };
+                animY.EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut };
+            }
+
+            transform.BeginAnimation(ScaleTransform.ScaleXProperty, animX);
+            transform.BeginAnimation(ScaleTransform.ScaleYProperty, animY);
+        }
+
+        private void KeyBorder_MouseEnter(object sender, System.Windows.Input.MouseEventArgs e)
+        {
+            if (sender is System.Windows.Controls.Border b)
+            {
+                // Give it a subtle bump when hovering over
+                ApplyJellyAnimation(b, 1.05, 1.05, 500, true);
+            }
+        }
+
         private void KeyBorder_MouseDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
         {
             if (e.StylusDevice != null) return; // 忽略被 WPF 轉換的觸控假滑鼠事件
-            if (sender is System.Windows.Controls.Border b) b.Opacity = 0.5;
+            if (IsEditMode) return; // 進入編輯模式時停用任何觸發特效與按鍵行為
+
+            if (sender is System.Windows.Controls.Border b)
+            {
+                b.Opacity = 0.8;
+                // 真·果凍擠壓：寬度變寬，高度變扁 (體積守恆錯覺)
+                ApplyJellyAnimation(b, 1.12, 0.85, 100, false);
+            }
             if ((sender as FrameworkElement)?.DataContext is KeyModel key) { e.Handled = true; OnKeyClick(key); }
         }
 
         private void KeyBorder_MouseUp(object sender, System.Windows.Input.MouseButtonEventArgs e)
         {
-            if (sender is System.Windows.Controls.Border b) b.ClearValue(UIElement.OpacityProperty);
+            if (sender is System.Windows.Controls.Border b)
+            {
+                b.ClearValue(UIElement.OpacityProperty);
+                // 誇張的果凍回彈
+                ApplyJellyAnimation(b, 1.0, 1.0, 1000, true);
+            }
         }
 
         private void KeyBorder_MouseLeave(object sender, System.Windows.Input.MouseEventArgs e)
         {
-            if (sender is System.Windows.Controls.Border b) b.ClearValue(UIElement.OpacityProperty);
+            if (sender is System.Windows.Controls.Border b)
+            {
+                b.ClearValue(UIElement.OpacityProperty);
+                // Return to normal size cleanly
+                ApplyJellyAnimation(b, 1.0, 1.0, 300, false);
+            }
         }
 
         private void KeyBorder_TouchDown(object sender, System.Windows.Input.TouchEventArgs e)
         {
-            if (sender is System.Windows.Controls.Border b) b.Opacity = 0.5;
+            if (IsEditMode) return; // 進入編輯模式時停用所有輸入交互
+            if (sender is System.Windows.Controls.Border b)
+            {
+                b.Opacity = 0.8;
+                // 真·果凍擠壓
+                ApplyJellyAnimation(b, 1.12, 0.85, 100, false);
+            }
             if ((sender as FrameworkElement)?.DataContext is KeyModel key) { e.Handled = true; OnKeyClick(key); }
         }
 
         private void KeyBorder_TouchUp(object sender, System.Windows.Input.TouchEventArgs e)
         {
-            if (sender is System.Windows.Controls.Border b) b.ClearValue(UIElement.OpacityProperty);
+            if (sender is System.Windows.Controls.Border b)
+            {
+                b.ClearValue(UIElement.OpacityProperty);
+                ApplyJellyAnimation(b, 1.0, 1.0, 1000, true);
+            }
         }
 
         private void KeyBorder_TouchLeave(object sender, System.Windows.Input.TouchEventArgs e)
         {
-            if (sender is System.Windows.Controls.Border b) b.ClearValue(UIElement.OpacityProperty);
+            if (sender is System.Windows.Controls.Border b)
+            {
+                b.ClearValue(UIElement.OpacityProperty);
+                ApplyJellyAnimation(b, 1.0, 1.0, 300, false);
+            }
         }
+
+        #region 拖曳交換按鈕邏輯
+        private void KeyBorder_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (!IsEditMode) return;
+            if (e.StylusDevice != null) return;
+            if (sender is System.Windows.Controls.Border border && border.DataContext is KeyModel key)
+            {
+                e.Handled = true;
+                _dragStartPoint = e.GetPosition(this);
+                _draggedBorder = border;
+                _draggedKey = key;
+                _isManualDragging = false;
+                border.CaptureMouse();
+            }
+        }
+
+        private void KeyBorder_PreviewTouchDown(object sender, System.Windows.Input.TouchEventArgs e)
+        {
+            if (!IsEditMode) return;
+            if (sender is System.Windows.Controls.Border border && border.DataContext is KeyModel key)
+            {
+                e.Handled = true;
+                _dragStartPoint = e.GetTouchPoint(this).Position;
+                _draggedBorder = border;
+                _draggedKey = key;
+                _isManualDragging = false;
+                e.TouchDevice.Capture(border);
+            }
+        }
+
+        private void Window_PreviewMouseMove(object sender, System.Windows.Input.MouseEventArgs e)
+        {
+            if (!IsEditMode || _draggedKey == null || _draggedBorder == null) return;
+            if (e.StylusDevice != null) return;
+
+            if (e.LeftButton == MouseButtonState.Pressed)
+            {
+                HandleDragMove(e.GetPosition(this), e.GetPosition(DragOverlay));
+            }
+        }
+
+        private void Window_PreviewTouchMove(object sender, System.Windows.Input.TouchEventArgs e)
+        {
+            if (!IsEditMode || _draggedKey == null || _draggedBorder == null) return;
+            HandleDragMove(e.GetTouchPoint(this).Position, e.GetTouchPoint(DragOverlay).Position);
+        }
+
+        private void HandleDragMove(System.Windows.Point posInWindow, System.Windows.Point posInOverlay)
+        {
+            if (!_isManualDragging)
+            {
+                Vector diff = _dragStartPoint - posInWindow;
+                if (Math.Abs(diff.X) > SystemParameters.MinimumHorizontalDragDistance ||
+                    Math.Abs(diff.Y) > SystemParameters.MinimumVerticalDragDistance)
+                {
+                    StartManualDrag(posInOverlay);
+                }
+            }
+
+            if (_isManualDragging && _dragGhost != null)
+            {
+                Canvas.SetLeft(_dragGhost, posInOverlay.X - _ghostOffset.X);
+                Canvas.SetTop(_dragGhost, posInOverlay.Y - _ghostOffset.Y);
+            }
+        }
+
+        private void StartManualDrag(System.Windows.Point posInOverlay)
+        {
+            if (_draggedBorder == null) return;
+            _isManualDragging = true;
+
+            var rtb = new System.Windows.Media.Imaging.RenderTargetBitmap((int)Math.Max(1, _draggedBorder.ActualWidth), (int)Math.Max(1, _draggedBorder.ActualHeight), 96, 96, System.Windows.Media.PixelFormats.Pbgra32);
+            rtb.Render(_draggedBorder);
+            var brush = new System.Windows.Media.ImageBrush(rtb) { Stretch = System.Windows.Media.Stretch.None };
+
+            _dragGhost = new System.Windows.Shapes.Rectangle
+            {
+                Width = _draggedBorder.ActualWidth,
+                Height = _draggedBorder.ActualHeight,
+                Fill = brush,
+                Opacity = 0.8
+            };
+
+            System.Windows.Point borderPos = _draggedBorder.TranslatePoint(new System.Windows.Point(0, 0), DragOverlay);
+            _ghostOffset = new System.Windows.Point(posInOverlay.X - borderPos.X, posInOverlay.Y - borderPos.Y);
+
+            Canvas.SetLeft(_dragGhost, borderPos.X);
+            Canvas.SetTop(_dragGhost, borderPos.Y);
+
+            var rTrans = new RotateTransform();
+            _dragGhost.RenderTransform = rTrans;
+            _dragGhost.RenderTransformOrigin = new System.Windows.Point(0.5, 0.5);
+            var anim = new DoubleAnimation(-4, 4, new Duration(TimeSpan.FromMilliseconds(50))) { AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever };
+            rTrans.BeginAnimation(RotateTransform.AngleProperty, anim);
+
+            DragOverlay.Children.Add(_dragGhost);
+            _draggedBorder.Opacity = 0.0;
+        }
+
+        private void Window_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            if (!IsEditMode) return;
+            if (e.StylusDevice != null) return;
+            HandleDrop(e.GetPosition(MainRootGrid));
+        }
+
+        private void Window_PreviewTouchUp(object sender, System.Windows.Input.TouchEventArgs e)
+        {
+            if (!IsEditMode) return;
+            HandleDrop(e.GetTouchPoint(MainRootGrid).Position);
+        }
+
+        private async void HandleDrop(System.Windows.Point dropPt)
+        {
+            if (_isManualDragging && _draggedBorder != null && _dragGhost != null && _draggedKey != null)
+            {
+                _isManualDragging = false;
+                _draggedBorder.ReleaseMouseCapture();
+                _draggedBorder.ReleaseAllTouchCaptures();
+
+                System.Windows.Controls.Border? targetBorder = null;
+                KeyModel? targetKey = null;
+
+                // Perform HitTest without picking up the Ghost rectangle itself
+                VisualTreeHelper.HitTest(MainRootGrid, null, new HitTestResultCallback(result =>
+                {
+                    DependencyObject visualHit = result.VisualHit;
+                    while (visualHit != null && !(visualHit is System.Windows.Controls.Border))
+                    {
+                        visualHit = VisualTreeHelper.GetParent(visualHit);
+                    }
+
+                    if (visualHit is System.Windows.Controls.Border b && b.DataContext is KeyModel km && b != _draggedBorder)
+                    {
+                        targetBorder = b;
+                        targetKey = km;
+                        return HitTestResultBehavior.Stop;
+                    }
+
+                    return HitTestResultBehavior.Continue;
+                }), new PointHitTestParameters(dropPt));
+
+                if (targetBorder != null && targetKey != null)
+                {
+                    _dragGhost.RenderTransform.BeginAnimation(RotateTransform.AngleProperty, null);
+
+                    var targetRtb = new System.Windows.Media.Imaging.RenderTargetBitmap((int)Math.Max(1, targetBorder.ActualWidth), (int)Math.Max(1, targetBorder.ActualHeight), 96, 96, System.Windows.Media.PixelFormats.Pbgra32);
+                    targetRtb.Render(targetBorder);
+                    var targetBrush = new System.Windows.Media.ImageBrush(targetRtb) { Stretch = System.Windows.Media.Stretch.None };
+                    var targetGhost = new System.Windows.Shapes.Rectangle
+                    {
+                        Width = targetBorder.ActualWidth,
+                        Height = targetBorder.ActualHeight,
+                        Fill = targetBrush
+                    };
+
+                    System.Windows.Point targetPos = targetBorder.TranslatePoint(new System.Windows.Point(0, 0), DragOverlay);
+                    System.Windows.Point startGhostPos = new System.Windows.Point(Canvas.GetLeft(_dragGhost), Canvas.GetTop(_dragGhost));
+
+                    Canvas.SetLeft(targetGhost, targetPos.X);
+                    Canvas.SetTop(targetGhost, targetPos.Y);
+                    DragOverlay.Children.Add(targetGhost);
+
+                    targetBorder.Opacity = 0.0;
+
+                    var duration = TimeSpan.FromMilliseconds(200);
+                    var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+
+                    var animX1 = new DoubleAnimation(startGhostPos.X, targetPos.X, duration) { EasingFunction = ease };
+                    var animY1 = new DoubleAnimation(startGhostPos.Y, targetPos.Y, duration) { EasingFunction = ease };
+                    var animX2 = new DoubleAnimation(targetPos.X, startGhostPos.X, duration) { EasingFunction = ease };
+                    var animY2 = new DoubleAnimation(targetPos.Y, startGhostPos.Y, duration) { EasingFunction = ease };
+
+                    _dragGhost.BeginAnimation(Canvas.LeftProperty, animX1);
+                    _dragGhost.BeginAnimation(Canvas.TopProperty, animY1);
+
+                    targetGhost.BeginAnimation(Canvas.LeftProperty, animX2);
+                    targetGhost.BeginAnimation(Canvas.TopProperty, animY2);
+
+                    await System.Threading.Tasks.Task.Delay(210);
+
+                    SwapKeys(_draggedKey, targetKey);
+                    SaveSettings();
+
+                    targetBorder.Opacity = 1.0;
+                }
+                else
+                {
+                    _dragGhost.RenderTransform.BeginAnimation(RotateTransform.AngleProperty, null);
+                    System.Windows.Point origPos = _draggedBorder.TranslatePoint(new System.Windows.Point(0, 0), DragOverlay);
+
+                    var duration = TimeSpan.FromMilliseconds(200);
+                    var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+                    var animX = new DoubleAnimation(Canvas.GetLeft(_dragGhost), origPos.X, duration) { EasingFunction = ease };
+                    var animY = new DoubleAnimation(Canvas.GetTop(_dragGhost), origPos.Y, duration) { EasingFunction = ease };
+
+                    _dragGhost.BeginAnimation(Canvas.LeftProperty, animX);
+                    _dragGhost.BeginAnimation(Canvas.TopProperty, animY);
+
+                    await System.Threading.Tasks.Task.Delay(210);
+                }
+
+                DragOverlay.Children.Clear();
+                _draggedBorder.Opacity = 1.0;
+                _draggedBorder = null;
+                _draggedKey = null;
+                _dragGhost = null;
+            }
+            else
+            {
+                if (_draggedBorder != null)
+                {
+                    _draggedBorder.ReleaseMouseCapture();
+                    _draggedBorder.ReleaseAllTouchCaptures();
+                }
+                _draggedBorder = null;
+                _draggedKey = null;
+            }
+        }
+
+        private void SwapKeys(KeyModel k1, KeyModel k2)
+        {
+            var tempWidth = k1.Width; k1.Width = k2.Width; k2.Width = tempWidth;
+            var tempHeight = k1.Height; k1.Height = k2.Height; k2.Height = tempHeight;
+            var tempLeftM = k1.LeftMargin; k1.LeftMargin = k2.LeftMargin; k2.LeftMargin = tempLeftM;
+            var tempTopM = k1.TopMargin; k1.TopMargin = k2.TopMargin; k2.TopMargin = tempTopM;
+            var tempAlign = k1.IsCenterAligned; k1.IsCenterAligned = k2.IsCenterAligned; k2.IsCenterAligned = tempAlign;
+
+            ObservableCollection<KeyModel>? r1 = null;
+            int idx1 = -1;
+            ObservableCollection<KeyModel>? r2 = null;
+            int idx2 = -1;
+
+            foreach (var row in KeyRows)
+            {
+                if (r1 == null) { int i = row.IndexOf(k1); if (i >= 0) { r1 = row; idx1 = i; } }
+                if (r2 == null) { int i = row.IndexOf(k2); if (i >= 0) { r2 = row; idx2 = i; } }
+                if (r1 != null && r2 != null) break;
+            }
+
+            if (r1 != null && r2 != null)
+            {
+                if (r1 == r2)
+                {
+                    r1.Move(idx1, idx2);
+                    if (idx1 < idx2) r1.Move(idx2 - 1, idx1);
+                    else r1.Move(idx2 + 1, idx1);
+                }
+                else
+                {
+                    r1.RemoveAt(idx1);
+                    r1.Insert(idx1, k2);
+                    r2.RemoveAt(idx2);
+                    r2.Insert(idx2, k1);
+                }
+            }
+
+            UpdateDisplay();
+        }
+        #endregion
 
         private void UpdateDisplay()
         {
             bool upper = _isCapsLockActive ^ _isShiftActive;
             bool symbols = _isShiftActive;
 
-            bool displayZhuyin = _localPreviewToggle ? !_isZhuyinMode : _isZhuyinMode;
+            // 真正的中文輸入狀態是：是在注音模式下 && 沒有被 Shift 切換成臨時英文
+            bool isActuallyChinese = _isZhuyinMode && !_temporaryEnglishMode;
+            bool displayZhuyin = _localPreviewToggle ? !isActuallyChinese : isActuallyChinese;
+
             ModeIndicator = displayZhuyin ? "En" : "ㄅ";
 
             if (displayZhuyin)
@@ -886,9 +1652,9 @@ namespace OSK
                 IndicatorColor = _isDarkMode ? "White" : "#333333";
             }
 
-            if (_temporaryEnglishMode)
+            if (_temporaryEnglishMode && _isZhuyinMode)
             {
-                ModeIndicator = "En";
+                // 如果是在微軟注音下的英文模式 (Shift 切換)，用特定顏色標註
                 IndicatorColor = _themeActiveColor;
             }
 
@@ -924,28 +1690,32 @@ namespace OSK
                         continue;
                     }
 
-                    bool isZhuyinShiftState = _isZhuyinMode && (_isShiftActive || _temporaryEnglishMode);
-                    if (isZhuyinShiftState)
+                    // 處理注音模式下的 Shift 狀態或臨時英文模式
+                    // 為了統一視覺體驗與修飾鍵行為，兩者公用一套符號映射邏輯
+                    bool isZhuyinShiftOrTempEnglish = _isZhuyinMode && (_isShiftActive || _temporaryEnglishMode);
+
+                    if (isZhuyinShiftOrTempEnglish)
                     {
                         string? overrideLabel = null;
                         switch (k.VkCode)
                         {
+                            case 0xC0: overrideLabel = "～"; break;
                             case 0x31: overrideLabel = "！"; break;
-                            case 0x32: overrideLabel = "@"; break;
-                            case 0x33: overrideLabel = "#"; break;
-                            case 0x34: overrideLabel = "￥"; break;
-                            case 0x35: overrideLabel = "%"; break;
-                            case 0x36: overrideLabel = "……ˊ"; break;
-                            case 0x37: overrideLabel = "&˙"; break;
-                            case 0x38: overrideLabel = "*"; break;
+                            case 0x32: overrideLabel = "＠"; break;
+                            case 0x33: overrideLabel = "＃"; break;
+                            case 0x34: overrideLabel = "＄"; break;
+                            case 0x35: overrideLabel = "％"; break;
+                            case 0x36: overrideLabel = "^"; break;
+                            case 0x37: overrideLabel = "＆"; break;
+                            case 0x38: overrideLabel = "＊"; break;
                             case 0x39: overrideLabel = "（"; break;
                             case 0x30: overrideLabel = "）"; break;
-                            case 0xBD: overrideLabel = "——"; break;
-                            case 0xBB: overrideLabel = "+"; break;
-                            case 0xDB: overrideLabel = "『"; break;
-                            case 0xDD: overrideLabel = "』"; break;
-                            case 0xDC: overrideLabel = "、"; break;
-                            case 0xDE: overrideLabel = "”"; break;
+                            case 0xBD: overrideLabel = "＿"; break;
+                            case 0xBB: overrideLabel = "＋"; break;
+                            case 0xDB: overrideLabel = "〔"; break;
+                            case 0xDD: overrideLabel = "〕"; break;
+                            case 0xDC: overrideLabel = "｜"; break;
+                            case 0xDE: overrideLabel = "；"; break;
                             case 0xBA: overrideLabel = "："; break;
                             case 0xBC: overrideLabel = "，"; break;
                             case 0xBE: overrideLabel = "。"; break;
@@ -959,19 +1729,16 @@ namespace OSK
                         }
                         else
                         {
-                            k.DisplayName = upper ? k.EnglishUpper : k.English;
-                            k.DynamicTextColor = _themeTextColor;
+                            // 字母始終顯示大寫並使用副色 (當在臨時模式或按住 Shift 時)
+                            bool isLetter = k.VkCode >= 0x41 && k.VkCode <= 0x5A;
+                            k.DisplayName = (isLetter || upper) ? k.EnglishUpper : k.English;
+                            k.DynamicTextColor = (isLetter || _temporaryEnglishMode) ? _themeSubColor : _themeTextColor;
                         }
                     }
-                    else if (_isZhuyinMode && !symbols && !string.IsNullOrEmpty(k.Zhuyin) && !_temporaryEnglishMode)
+                    else if (_isZhuyinMode && !string.IsNullOrEmpty(k.Zhuyin))
                     {
                         k.DisplayName = k.Zhuyin;
                         k.DynamicTextColor = _isDarkMode ? "Orange" : "#D2691E";
-                    }
-                    else if (_temporaryEnglishMode && (k.VkCode >= 0x41 && k.VkCode <= 0x5A))
-                    {
-                        k.DisplayName = k.EnglishUpper;
-                        k.DynamicTextColor = _themeSubColor;
                     }
                     else
                     {
@@ -1142,6 +1909,7 @@ namespace OSK
             r0.Add(new KeyModel { English = "🔇", EnglishUpper = "🔇", Zhuyin = "", VkCode = 0xAD, LeftMargin = 32, IsCenterAligned = true });
             r0.Add(new KeyModel { English = "🔉", EnglishUpper = "🔉", Zhuyin = "", VkCode = 0xAE, IsCenterAligned = true });
             r0.Add(new KeyModel { English = "🔊", EnglishUpper = "🔊", Zhuyin = "", VkCode = 0xAF, IsCenterAligned = true });
+            r0.Add(new KeyModel { English = "⌃⌥⌦", EnglishUpper = "⌃⌥⌦", Zhuyin = "", VkCode = CAD_KEY_CODE, IsCenterAligned = true });
 
             KeyRows.Add(r0);
 
@@ -1270,20 +2038,349 @@ namespace OSK
             UpdateDisplay();
         }
 
-        private void Minimize_Click(object sender, RoutedEventArgs e) => this.Hide();
-        private void Exit_Click(object sender, RoutedEventArgs e) => System.Windows.Application.Current.Shutdown();
+        #region INI 設定檔讀寫 (透明度, 視窗位置, 自訂按鍵版面)
+        private void LoadSettings()
+        {
+            bool hasSavedTheme = false;
+            if (!File.Exists(_iniFilePath)) return;
+
+            try
+            {
+                var lines = File.ReadAllLines(_iniFilePath);
+                foreach (var line in lines)
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    var parts = line.Split('=', 2);
+                    if (parts.Length != 2) continue;
+
+                    string key = parts[0].Trim();
+                    string val = parts[1].Trim();
+
+                    if (key == "Opacity" && double.TryParse(val, out double op))
+                    {
+                        double finalOp = Math.Max(0.2, Math.Min(1.0, op));
+                        this.Opacity = finalOp;
+                        if (OpacitySlider != null) OpacitySlider.Value = finalOp;
+                    }
+                    else if (key == "Left" && double.TryParse(val, out double left))
+                    {
+                        this.Left = left;
+                    }
+                    else if (key == "Top" && double.TryParse(val, out double top))
+                    {
+                        this.Top = top;
+                    }
+                    else if (key == "IsFullLayout" && bool.TryParse(val, out bool isFull))
+                    {
+                        if (this.IsFullLayout != isFull) ToggleFullLayout(null);
+                    }
+                    else if (key == "IsDynamicLayout" && bool.TryParse(val, out bool isDyn))
+                    {
+                        this.IsDynamicLayout = isDyn;
+                    }
+                    else if (key == "IsPinned" && bool.TryParse(val, out bool isPin))
+                    {
+                        _isPinned = isPin;
+                        this.Topmost = isPin;
+                        OnPropertyChanged("PinIcon");
+                    }
+                    else if (key == "Width" && double.TryParse(val, out double w))
+                    {
+                        this.Width = w;
+                        double ratio = IsFullLayout ? 0.23 : 0.31;
+                        double minH = Math.Max(w * ratio + 45, 120);
+                        this.MinHeight = minH;
+                        this.MaxHeight = minH;
+                    }
+                    else if (key == "Height" && double.TryParse(val, out double h))
+                    {
+                        this.Height = h;
+                    }
+                    else if (key == "IsDarkMode" && bool.TryParse(val, out bool isDark))
+                    {
+                        hasSavedTheme = true;
+                        ApplyTheme(isDark);
+                    }
+                    else if (key == "BgColor" && !string.IsNullOrEmpty(val))
+                    {
+                        // 舊版相容性
+                    }
+                    else if (key == "TextColor" && !string.IsNullOrEmpty(val))
+                    {
+                        // 舊版相容性
+                    }
+                }
+
+                // 嘗試套用自訂排列
+                ApplyCustomLayout();
+            }
+            catch { }
+
+            if (!hasSavedTheme)
+            {
+                DetectSystemTheme();
+            }
+        }
+
+        private void ApplyCustomLayout()
+        {
+            if (!File.Exists(_iniFilePath)) return;
+            string prefix = IsFullLayout ? "FullRow" : "CompactRow";
+
+            try
+            {
+                var lines = File.ReadAllLines(_iniFilePath);
+                var dict = new Dictionary<string, string>();
+                foreach (var line in lines)
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    var parts = line.Split('=', 2);
+                    if (parts.Length == 2) dict[parts[0].Trim()] = parts[1].Trim();
+                }
+
+                // 若該版面設定不存在，直接返回
+                bool hasLayout = false;
+                for (int i = 0; i < KeyRows.Count; i++)
+                {
+                    if (dict.ContainsKey($"{prefix}{i}")) hasLayout = true;
+                }
+                if (!hasLayout) return;
+
+                // 收集所有「原始的 KeyModel」供跨列全域搜尋
+                var allOriginalKeys = KeyRows.SelectMany(r => r).ToList();
+                var keyOriginalRowMap = new Dictionary<KeyModel, int>();
+                var originalLayoutsPerRow = new List<List<(double Width, double Height, double LeftMargin, double TopMargin, bool IsCenterAligned)>>();
+
+                for (int i = 0; i < KeyRows.Count; i++)
+                {
+                    var layouts = new List<(double Width, double Height, double LeftMargin, double TopMargin, bool IsCenterAligned)>();
+                    foreach (var k in KeyRows[i])
+                    {
+                        keyOriginalRowMap[k] = i;
+                        layouts.Add((k.Width, k.Height, k.LeftMargin, k.TopMargin, k.IsCenterAligned));
+                    }
+                    originalLayoutsPerRow.Add(layouts);
+                }
+
+                var newRows = new List<ObservableCollection<KeyModel>>();
+                for (int i = 0; i < KeyRows.Count; i++)
+                {
+                    newRows.Add(new ObservableCollection<KeyModel>());
+                }
+
+                // 根據 ini 把各按鈕放進目標的列與位置
+                for (int i = 0; i < KeyRows.Count; i++)
+                {
+                    string layoutKey = $"{prefix}{i}";
+                    if (dict.TryGetValue(layoutKey, out string? orderStr) && !string.IsNullOrEmpty(orderStr))
+                    {
+                        var ids = orderStr.Split(',').ToList();
+                        foreach (var id in ids)
+                        {
+                            var match = allOriginalKeys.FirstOrDefault(k => k.Id == id);
+                            if (match != null)
+                            {
+                                newRows[i].Add(match);
+                                allOriginalKeys.Remove(match); // 移出總清單，表示已被用掉
+                            }
+                        }
+                    }
+                }
+
+                // 把設定檔沒記載的剩餘按鍵塞回預設預期會出現的列，補齊版面
+                foreach (var remain in allOriginalKeys)
+                {
+                    newRows[keyOriginalRowMap[remain]].Add(remain);
+                }
+
+                // 將實體排版重新套用到底層的新順序上，讓按鈕的尺寸與間距保留在原位不崩壞
+                for (int i = 0; i < KeyRows.Count; i++)
+                {
+                    var newRow = newRows[i];
+                    var layouts = originalLayoutsPerRow[i];
+
+                    for (int j = 0; j < newRow.Count && j < layouts.Count; j++)
+                    {
+                        newRow[j].Width = layouts[j].Width;
+                        newRow[j].Height = layouts[j].Height;
+                        newRow[j].LeftMargin = layouts[j].LeftMargin;
+                        newRow[j].TopMargin = layouts[j].TopMargin;
+                        newRow[j].IsCenterAligned = layouts[j].IsCenterAligned;
+                    }
+
+                    KeyRows[i] = newRow;
+                }
+            }
+            catch { }
+        }
+
+        private void SaveSettings()
+        {
+            try
+            {
+                var lines = new List<string>
+                {
+                    $"Opacity={this.Opacity}",
+                    $"Width={this.Width}",
+                    $"Height={this.Height}",
+                    $"Left={this.Left}",
+                    $"Top={this.Top}",
+                    $"IsFullLayout={this.IsFullLayout}",
+                    $"IsDynamicLayout={this.IsDynamicLayout}",
+                    $"IsPinned={_isPinned}",
+                    $"IsDarkMode={_isDarkMode}"
+                };
+
+                // 儲存目前的版面按鍵順序
+                string prefix = IsFullLayout ? "FullRow" : "CompactRow";
+                for (int i = 0; i < KeyRows.Count; i++)
+                {
+                    var ids = KeyRows[i].Select(k => k.Id);
+                    lines.Add($"{prefix}{i}={string.Join(",", ids)}");
+                }
+
+                // 也讀取未選上版面的舊紀錄，避免被洗掉
+                if (File.Exists(_iniFilePath))
+                {
+                    var oldLines = File.ReadAllLines(_iniFilePath);
+                    string otherPrefix = IsFullLayout ? "CompactRow" : "FullRow";
+                    foreach (var oldLine in oldLines)
+                    {
+                        if (oldLine.StartsWith(otherPrefix))
+                        {
+                            lines.Add(oldLine);
+                        }
+                    }
+                }
+
+                File.WriteAllLines(_iniFilePath, lines);
+            }
+            catch { }
+        }
+        #endregion
+
+        private void Minimize_Click(object sender, RoutedEventArgs e)
+        {
+            this.Hide();
+            Task.Delay(500).ContinueWith(_ => this.Dispatcher.Invoke(() => ReduceMemoryUsage()));
+        }
+
+        private void Exit_Click(object sender, RoutedEventArgs e)
+        {
+            var result = System.Windows.MessageBox.Show(
+                "確定要關閉虛擬鍵盤嗎？",
+                "OSK 關閉確認",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question,
+                MessageBoxResult.No);
+
+            if (result == MessageBoxResult.Yes)
+            {
+                System.Windows.Application.Current.Shutdown();
+            }
+        }
 
         private void RestoreSize_Click(object sender, RoutedEventArgs e)
         {
+            var result = System.Windows.MessageBox.Show(
+                "確定要恢復預設配置嗎？\n您將會遺失所有自定義的按鍵位置與透明度設定。",
+                "重置警告",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning,
+                MessageBoxResult.No);
+
+            if (result != MessageBoxResult.Yes) return;
+            // 清除設定檔並恢復所有預設值
             this.Width = 1000;
-            double ratio = IsFullLayout ? 0.23 : 0.31;
+            if (this.IsFullLayout)
+            {
+                ToggleFullLayout(null);
+            }
+            double ratio = 0.31;
             double minH = Math.Max(this.Width * ratio + 45, 120);
             this.MinHeight = minH;
             this.MaxHeight = minH;
             this.Height = minH;
+
+            this.Opacity = 1.0;
+            this.IsEditMode = false;
+
+            _isPinned = true;
+            OnPropertyChanged("PinIcon");
+            this.Topmost = true; // 預設為 true
+
+            this.IsDynamicLayout = true; // 預設為 true
+
+            // 恢復顏色為系統預設
+            DetectSystemTheme();
+
+            if (OpacitySlider != null) OpacitySlider.Value = 1.0;
+            MainRootGrid.Opacity = 1.0;
+
+            if (File.Exists(_iniFilePath))
+            {
+                try { File.Delete(_iniFilePath); } catch { }
+            }
+
+            KeyRows.Clear();
+            if (IsFullLayout) SetupFullKeyboard();
+            else SetupKeyboard();
+
+            KeyBoardItemsControl.ItemsSource = null;
+            KeyBoardItemsControl.ItemsSource = KeyRows;
+
+            // 讓視窗回到中央位置
+            CenterWindow();
         }
 
-        private void Window_MouseLeftButtonDown(object sender, MouseButtonEventArgs e) { if (!_isResizing) this.DragMove(); }
+        private void Window_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            // 如果事件來源是觸控/手寫筆，或者是正在觸控拖曳狀態，則不執行 DragMove
+            if (e.StylusDevice != null || _isTouchDraggingWindow) return;
+
+            if (!_isResizing) this.DragMove();
+        }
+
+        private void TopTitleBar_TouchDown(object sender, System.Windows.Input.TouchEventArgs e)
+        {
+            if (IsEditMode) return;
+            if (sender is UIElement el)
+            {
+                _isTouchDraggingWindow = true;
+                // 記錄在視窗中的相對位置
+                _touchDragStartPoint = e.GetTouchPoint(this).Position;
+                el.CaptureTouch(e.TouchDevice);
+                e.Handled = true; // 阻止向下轉換為滑鼠事件並呼叫 DragMove
+            }
+        }
+
+        private void TopTitleBar_TouchMove(object sender, System.Windows.Input.TouchEventArgs e)
+        {
+            if (_isTouchDraggingWindow)
+            {
+                var pos = e.GetTouchPoint(this).Position;
+                double dx = pos.X - _touchDragStartPoint.X;
+                double dy = pos.Y - _touchDragStartPoint.Y;
+
+                // 透過位移差調整視窗絕對位置 (此舉會將視窗瞬移，使相對 local 的指標位置回歸原點)
+                this.Left += dx;
+                this.Top += dy;
+            }
+        }
+
+        private void Window_ManipulationBoundaryFeedback(object sender, ManipulationBoundaryFeedbackEventArgs e)
+        {
+            e.Handled = true;
+        }
+
+        private void TopTitleBar_TouchUp(object sender, System.Windows.Input.TouchEventArgs e)
+        {
+            if (_isTouchDraggingWindow)
+            {
+                _isTouchDraggingWindow = false;
+                if (sender is UIElement el) el.ReleaseTouchCapture(e.TouchDevice);
+            }
+        }
         private void Resize_Init(object sender, MouseButtonEventArgs e) { _isResizing = true; Mouse.Capture((UIElement)sender); }
         private void Resize_End(object sender, MouseButtonEventArgs e) { _isResizing = false; Mouse.Capture(null); }
         private void Resize_Move(object sender, System.Windows.Input.MouseEventArgs e)
@@ -1294,14 +2391,20 @@ namespace OSK
                 if (p.X > 200) this.Width = p.X;
 
                 double ratio = _isFullLayout ? 0.23 : 0.31;
-                double minH = Math.Max(this.Width * ratio + 45, 120);
+                double minH = Math.Max(this.Width * ratio + 5, 80);
                 this.MinHeight = minH;
                 this.MaxHeight = minH;
                 this.Height = minH;
             }
         }
 
-        protected override void OnClosed(EventArgs e) { _notifyIcon?.Dispose(); _inputDetector?.Stop(); base.OnClosed(e); }
+        protected override void OnClosed(EventArgs e)
+        {
+            _notifyIcon?.Dispose();
+            _inputDetector?.Stop();
+            if (!IsEditMode) SaveSettings(); // 確保關閉時儲存
+            base.OnClosed(e);
+        }
 
         protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
         {
@@ -1315,17 +2418,6 @@ namespace OSK
 
         public event PropertyChangedEventHandler? PropertyChanged;
         protected void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
-
-        private void OpacitySlider_PreviewMouseLeftButtonDown(object? sender, System.Windows.Input.MouseButtonEventArgs e)
-        {
-            if (sender is not System.Windows.Controls.Slider slider) return;
-            var pt = e.GetPosition(slider);
-            double ratio = pt.X / slider.ActualWidth;
-            if (ratio < 0) ratio = 0; if (ratio > 1) ratio = 1;
-            double newValue = slider.Minimum + (slider.Maximum - slider.Minimum) * ratio;
-            slider.Value = newValue;
-            e.Handled = true;
-        }
 
         private void ShowSecurityMenu()
         {
@@ -1425,7 +2517,22 @@ namespace OSK
         public string DynamicTextColor { get { return _dynamicTextColor; } set { _dynamicTextColor = value; OnPropertyChanged("DynamicTextColor"); } }
 
         public byte VkCode { get; set; }
-        public double Width { get; set; } = 65;
+
+        private double _width = 65;
+        public double Width
+        {
+            get => _width;
+            set
+            {
+                if (_width != value)
+                {
+                    _width = value;
+                    OnPropertyChanged(nameof(Width));
+                }
+            }
+        }
+
+        public string Id => $"{VkCode}_{System.Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(English ?? ""))}";
 
         private double _height = 55;
         public double Height
@@ -1464,7 +2571,24 @@ namespace OSK
 
         public System.Windows.Thickness Margin => new System.Windows.Thickness(_leftMargin, _topMargin, 2, _height > 55 ? 55 - _height + 2 : 2);
 
-        public bool IsCenterAligned { get; set; } = false;
+        private bool _isCenterAligned = false;
+        public bool IsCenterAligned
+        {
+            get => _isCenterAligned;
+            set
+            {
+                if (_isCenterAligned != value)
+                {
+                    _isCenterAligned = value;
+                    OnPropertyChanged(nameof(IsCenterAligned));
+                    OnPropertyChanged(nameof(MainColSpan));
+                    OnPropertyChanged(nameof(MainRowSpan));
+                    OnPropertyChanged(nameof(MainHorizontalAlignment));
+                    OnPropertyChanged(nameof(MainVerticalAlignment));
+                }
+            }
+        }
+
         public int MainColSpan => IsCenterAligned ? 2 : 1;
         public int MainRowSpan => IsCenterAligned ? 2 : 1;
         public string MainHorizontalAlignment => IsCenterAligned ? "Center" : "Left";

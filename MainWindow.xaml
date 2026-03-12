@@ -1,15 +1,26 @@
 <Window x:Class="OSK.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         Title="OSK" Height="330" Width="1000" 
         Topmost="True" WindowStyle="None" AllowsTransparency="True" ShowInTaskbar="False"
-        Background="{Binding WindowBackground}" 
+        Background="Transparent" 
         Stylus.IsPressAndHoldEnabled="False" Stylus.IsFlicksEnabled="False" Stylus.IsTapFeedbackEnabled="False"
-        ResizeMode="NoResize" Name="RootWindow">
+        Stylus.IsTouchFeedbackEnabled="False"
+        ResizeMode="NoResize" Name="RootWindow"
+        PreviewMouseMove="Window_PreviewMouseMove"
+        PreviewMouseLeftButtonUp="Window_PreviewMouseLeftButtonUp"
+        PreviewTouchMove="Window_PreviewTouchMove"
+        PreviewTouchUp="Window_PreviewTouchUp"
+        ManipulationBoundaryFeedback="Window_ManipulationBoundaryFeedback">
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="0" ResizeBorderThickness="0" CornerRadius="10" GlassFrameThickness="0" UseAeroCaptionButtons="False" />
+    </shell:WindowChrome.WindowChrome>
     <Window.Resources>
     </Window.Resources>
-    <Grid>
-        <!-- 右下角 Resize Grip：綁定 ResizeGripColor -->
+    <Border CornerRadius="10" Background="{Binding WindowBackground}" ClipToBounds="True">
+        <Grid x:Name="MainRootGrid" Background="Transparent" ClipToBounds="True">
+            <!-- 右下角 Resize Grip：綁定 ResizeGripColor -->
         <Grid VerticalAlignment="Bottom" HorizontalAlignment="Right" Width="25" Height="25" Cursor="SizeNWSE" MouseLeftButtonDown="Resize_Init" MouseMove="Resize_Move" MouseLeftButtonUp="Resize_End" Panel.ZIndex="100" Background="Transparent">
             <Path Data="M0,25 L25,25 L25,0 Z" Fill="{Binding ResizeGripColor}"/>
             <Path Data="M10,25 L25,10 M15,25 L25,15 M20,25 L25,20" Stroke="{Binding ResizeGripColor}" StrokeThickness="1"/>
@@ -20,7 +31,18 @@
                 <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
             <!-- 頂部拖曳區 (限縮於此區域) -->
-            <Grid Grid.Row="0" Background="Transparent" MouseLeftButtonDown="Window_MouseLeftButtonDown">
+            <Grid Grid.Row="0" Background="Transparent" MouseLeftButtonDown="Window_MouseLeftButtonDown" TouchDown="TopTitleBar_TouchDown" TouchMove="TopTitleBar_TouchMove" TouchUp="TopTitleBar_TouchUp">
+                <Grid.LayoutTransform>
+                    <ScaleTransform ScaleX="1.2" ScaleY="1.2"/>
+                </Grid.LayoutTransform>
+                <TextBlock Text="{Binding CurrentAppInfo}" 
+                           Foreground="{Binding UiTextColor}" 
+                           Opacity="0.6"
+                           FontSize="13" 
+                           HorizontalAlignment="Left" 
+                           VerticalAlignment="Top" 
+                           Margin="10,5,0,0" 
+                           IsHitTestVisible="False" />
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,0,5" Panel.ZIndex="50">
                     <!-- 全鍵盤/精簡版面切換按鈕 -->
                     <Button Command="{Binding ToggleFullLayoutCommand}" 
@@ -76,7 +98,14 @@
                             Background="{Binding ControlBtnBackground}" 
                             Foreground="{Binding UiTextColor}"
                             FontWeight="Bold" BorderThickness="0"
-                            ToolTip="恢復預設尺寸"/>
+                            ToolTip="恢復預設配置(包含版面與透明度)"/>
+                            
+                    <!-- 設定按鈕 (版面編輯) -->
+                    <Button Content=" ⚙ " Command="{Binding ToggleEditModeCommand}" Width="30" Height="25" Margin="0,0,2,0" 
+                            Background="{Binding ControlBtnBackground}" 
+                            Foreground="{Binding SettingsBtnColor}"
+                            FontWeight="Bold" BorderThickness="0"
+                            ToolTip="編輯按鈕位置"/>
                             
                     <!-- 最小化按鈕：文字綁定 UiTextColor，背景綁定 ControlBtnBackground -->
                     <Button Content=" 🗕 " Click="Minimize_Click" Width="30" Height="25" Margin="0,0,2,0" 
@@ -91,13 +120,14 @@
                             BorderThickness="0"/>
                 </StackPanel>
             </Grid>
-            <Viewbox Grid.Row="1" Stretch="Uniform" HorizontalAlignment="Stretch" VerticalAlignment="Bottom">
-                <ItemsControl Name="KeyBoardItemsControl">
-                    <ItemsControl.ItemsPanel>
-                        <ItemsPanelTemplate>
-                            <StackPanel/>
-                        </ItemsPanelTemplate>
-                    </ItemsControl.ItemsPanel>
+            <Viewbox Grid.Row="1" Stretch="Fill" HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
+                <Grid>
+                    <ItemsControl Name="KeyBoardItemsControl">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <StackPanel/>
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
                     <ItemsControl.ItemTemplate>
                         <DataTemplate>
                             <ItemsControl ItemsSource="{Binding}" ClipToBounds="False">
@@ -108,7 +138,7 @@
                                 </ItemsControl.ItemsPanel>
                                 <ItemsControl.ItemTemplate>
                                     <DataTemplate>
-                                        <Border BorderBrush="#444" BorderThickness="1" CornerRadius="3"
+                                        <Border BorderBrush="#33FFFFFF" BorderThickness="1" CornerRadius="6"
                                                 Background="{Binding Background}"
                                                 Width="{Binding Width}"
                                                 Height="{Binding Height}"
@@ -116,12 +146,16 @@
                                                 VerticalAlignment="Top"
                                                 Panel.ZIndex="10"
                                                 Cursor="Hand"
+                                                RenderTransformOrigin="0.5,0.5"
+                                                MouseEnter="KeyBorder_MouseEnter"
                                                 MouseDown="KeyBorder_MouseDown"
                                                 MouseUp="KeyBorder_MouseUp"
                                                 MouseLeave="KeyBorder_MouseLeave"
                                                 TouchDown="KeyBorder_TouchDown"
                                                 TouchUp="KeyBorder_TouchUp"
-                                                TouchLeave="KeyBorder_TouchLeave">
+                                                TouchLeave="KeyBorder_TouchLeave"
+                                                PreviewMouseLeftButtonDown="KeyBorder_PreviewMouseLeftButtonDown"
+                                                PreviewTouchDown="KeyBorder_PreviewTouchDown">
                                             <Border.Style>
                                                 <Style TargetType="Border">
                                                     <Style.Triggers>
@@ -177,8 +211,11 @@
                             <Setter Property="Margin" Value="0,0,0,0"/>
                         </Style>
                     </ItemsControl.ItemContainerStyle>
-                </ItemsControl>
+                    </ItemsControl>
+                    <Canvas x:Name="DragOverlay" IsHitTestVisible="False" Panel.ZIndex="1000"/>
+                </Grid>
             </Viewbox>
         </Grid>
-    </Grid>
+        </Grid>
+    </Border>
 </Window>
