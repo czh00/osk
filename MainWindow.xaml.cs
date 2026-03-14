@@ -167,17 +167,22 @@ namespace OSK
         private uint _msgShowOsk;
         private System.Windows.Forms.NotifyIcon? _notifyIcon;
         private static Mutex? _mutex;
+        private static readonly Random _rnd = new();
 
         public ObservableCollection<ObservableCollection<KeyModel>> KeyRows { get; set; } = new();
         public ICommand? KeyCommand { get; set; }
         public ICommand? ToggleThemeCommand { get; set; }
         public ICommand? TogglePinCommand { get; set; }
+        public ICommand? ToggleDragFxCommand { get; set; }
         public ICommand? ToggleLayoutCommand { get; set; }
         public ICommand? ToggleFullLayoutCommand { get; set; }
         public ICommand? ToggleEditModeCommand { get; set; }
 
         private bool _isPinned = true;
         public string PinIcon { get { return _isPinned ? "📍" : "📌"; } }
+
+        private bool _isDragFxEnabled = true;
+        public string DragFxIcon { get { return _isDragFxEnabled ? "🌊" : "⬛"; } }
 
         private bool _isEditMode = false;
         public bool IsEditMode { get { return _isEditMode; } set { _isEditMode = value; OnPropertyChanged("IsEditMode"); OnPropertyChanged("SettingsBtnColor"); } }
@@ -202,7 +207,7 @@ namespace OSK
 
         public string KeyboardAlignment => "Left";
 
-        private string _fullLayoutIcon = "📱";
+        private string _fullLayoutIcon = "⌨"; // 預設為精簡，圖示應顯示「切換至全鍵盤」
         public string FullLayoutIcon { get { return _fullLayoutIcon; } set { _fullLayoutIcon = value; OnPropertyChanged("FullLayoutIcon"); } }
 
         private bool _isZhuyinMode = false;
@@ -279,9 +284,10 @@ namespace OSK
         private DispatcherTimer _modeKeyTimer = new DispatcherTimer();
         private bool _modeKeyLongPressHandled = false;
 
-        // 視覺同步
-        private DispatcherTimer? _visualSyncTimer;
-        private int _imeCheckCounter = 0;
+        // 視覺同步 (使用 CompositionTarget.Rendering 取代 DispatcherTimer 以對齊 vsync)
+        private DispatcherTimer _memoryTrimTimer = new DispatcherTimer();
+        private DispatcherTimer _imeTimer = new DispatcherTimer();
+        private IntPtr _hHook = IntPtr.Zero;
 
         // Fn 模式對照表
         private static readonly Dictionary<byte, string?> FnDisplayMap = new()
@@ -334,6 +340,49 @@ namespace OSK
         private bool _needsInitialCentering = false;
 
         private string _iniFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "osk.ini");
+
+        // 視窗隨動追蹤
+        private double _lastWindowLeft = double.NaN;
+        private double _lastWindowTop = double.NaN;
+        private DateTime _lastFrameTime = DateTime.Now;
+        private bool _isCurrentlyDragging = false;
+        private int _lastDisplayStateHash = -1; 
+        private double _accumulatedDeltaX = 0; // 位移累積器，捕捉極微小位移
+        private double _accumulatedDeltaY = 0;
+
+        // Virtual Screen Target Properties
+        public double TargetLeft
+        {
+            get => SystemParameters.VirtualScreenLeft + Canvas.GetLeft(KeyboardContainer);
+            set
+            {
+                Canvas.SetLeft(KeyboardContainer, value - SystemParameters.VirtualScreenLeft);
+                SaveSettings();
+            }
+        }
+
+        public double TargetTop
+        {
+            get => SystemParameters.VirtualScreenTop + Canvas.GetTop(KeyboardContainer);
+            set
+            {
+                Canvas.SetTop(KeyboardContainer, value - SystemParameters.VirtualScreenTop);
+                SaveSettings();
+            }
+        }
+
+        public double TargetWidth
+        {
+            get => KeyboardContainer.Width;
+            set => KeyboardContainer.Width = value;
+        }
+
+        public double TargetHeight
+        {
+            get => KeyboardContainer.Height;
+            set => KeyboardContainer.Height = value;
+        }
+
         #endregion
 
         // 將特定按鍵加入到 User32 SendInput 結構清單中
@@ -378,10 +427,10 @@ namespace OSK
         // 清除所有虛擬修飾鍵的暫存狀態
         private void ResetVirtualModifiers()
         {
-            _virtualShiftToggle = false;
-            _virtualCtrlToggle = false;
-            _virtualWinToggle = false;
-            _virtualAltToggle = false;
+            if (_virtualShiftToggle) { SendSimulatedKey(_activeShiftVk, true); _virtualShiftToggle = false; }
+            if (_virtualCtrlToggle) { SendSimulatedKey(_activeCtrlVk, true); _virtualCtrlToggle = false; }
+            if (_virtualAltToggle) { SendSimulatedKey(_activeAltVk, true); _virtualAltToggle = false; }
+            if (_virtualWinToggle) { SendSimulatedKey(_activeWinVk, true); _virtualWinToggle = false; }
         }
 
         public MainWindow()
@@ -420,6 +469,7 @@ namespace OSK
             KeyCommand = new RelayCommand<KeyModel>(OnKeyClick);
             ToggleThemeCommand = new RelayCommand<object>(ToggleTheme);
             TogglePinCommand = new RelayCommand<object>(TogglePin);
+            ToggleDragFxCommand = new RelayCommand<object>(ToggleDragFx);
             ToggleLayoutCommand = new RelayCommand<object>(ToggleLayout);
             ToggleFullLayoutCommand = new RelayCommand<object>(ToggleFullLayout);
             ToggleEditModeCommand = new RelayCommand<object>(ToggleEditMode);
@@ -473,10 +523,19 @@ namespace OSK
             menu.Items.Add("結束", null, (s, e) => System.Windows.Application.Current.Shutdown());
             _notifyIcon.ContextMenuStrip = menu;
 
-            _visualSyncTimer = new DispatcherTimer(DispatcherPriority.Render);
-            _visualSyncTimer.Interval = TimeSpan.FromMilliseconds(30);
-            _visualSyncTimer.Tick += VisualSyncTimer_Tick;
-            _visualSyncTimer.Start();
+            // 使用 CompositionTarget.Rendering 讓物理計算與 WPF vsync 對齊，消除頓挫感
+            System.Windows.Media.CompositionTarget.Rendering += VisualSyncTimer_Tick;
+
+
+            _memoryTrimTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
+            _memoryTrimTimer.Tick += (s, e) => { ReduceMemoryUsage(); };
+            _memoryTrimTimer.Start();
+
+            // IME 檢測移至獨立的慢速計時器，避免每幀都呼叫昂貴的 Win32 API
+            _imeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(300) };
+            _imeTimer.Tick += (s, e) => { try { DetectImeStatus(); } catch { } };
+            _imeTimer.Start();
+
             _inputDetector = new InputDetector(this);
             if (!_isPinned)
             {
@@ -513,6 +572,12 @@ namespace OSK
             ApplyTheme(!_isDarkMode);
         }
 
+        private void ToggleDragFx(object? parameter)
+        {
+            _isDragFxEnabled = !_isDragFxEnabled;
+            OnPropertyChanged("DragFxIcon");
+        }
+
         private void TogglePin(object? parameter)
         {
             _isPinned = !_isPinned;
@@ -543,18 +608,14 @@ namespace OSK
             if (IsFullLayout)
             {
                 SetupFullKeyboard();
-                double targetH = Math.Max(this.Width * 0.23 + 5, 80);
-                this.MinHeight = targetH;
-                this.MaxHeight = targetH;
-                this.Height = targetH;
+                double targetH = Math.Max(TargetWidth * 0.23 + 5, 80);
+                TargetHeight = targetH;
             }
             else
             {
                 SetupKeyboard();
-                double targetH = Math.Max(this.Width * 0.31 + 5, 80);
-                this.MinHeight = targetH;
-                this.MaxHeight = targetH;
-                this.Height = targetH;
+                double targetH = Math.Max(TargetWidth * 0.31 + 5, 80);
+                TargetHeight = targetH;
             }
 
             // 切換版面後嘗試套用自訂排列
@@ -686,19 +747,19 @@ namespace OSK
                 double waWidth = Math.Max(0, bottomRight.X - topLeft.X);
                 double waHeight = Math.Max(0, bottomRight.Y - topLeft.Y);
 
-                double w = this.ActualWidth > 0 ? this.ActualWidth : (double.IsNaN(this.Width) ? 1000 : this.Width);
-                double h = this.ActualHeight > 0 ? this.ActualHeight : (double.IsNaN(this.Height) ? 360 : this.Height);
+                double w = TargetWidth;
+                double h = TargetHeight;
 
-                double newLeft = this.Left;
-                double newTop = this.Top;
+                double newLeft = TargetLeft;
+                double newTop = TargetTop;
 
                 if (newLeft < waLeft) newLeft = waLeft;
                 if (newLeft + w > waLeft + waWidth) newLeft = waLeft + waWidth - w;
                 if (newTop < waTop) newTop = waTop;
                 if (newTop + h > waTop + waHeight) newTop = waTop + waHeight - h;
 
-                if (this.Left != newLeft) this.Left = newLeft;
-                if (this.Top != newTop) this.Top = newTop;
+                if (TargetLeft != newLeft) TargetLeft = newLeft;
+                if (TargetTop != newTop) TargetTop = newTop;
             }
             finally
             {
@@ -706,10 +767,11 @@ namespace OSK
             }
         }
 
+
         private void CenterWindow()
         {
-            var cursorPos = System.Windows.Forms.Cursor.Position;
-            var screen = System.Windows.Forms.Screen.FromPoint(cursorPos);
+            var screen = System.Windows.Forms.Screen.PrimaryScreen;
+            if (screen == null) return;
             var wa = screen.WorkingArea;
 
             var source = PresentationSource.FromVisual(this);
@@ -723,11 +785,11 @@ namespace OSK
             double waWidth = Math.Max(0, bottomRight.X - topLeft.X);
             double waHeight = Math.Max(0, bottomRight.Y - topLeft.Y);
 
-            double w = this.ActualWidth > 0 ? this.ActualWidth : (double.IsNaN(this.Width) ? 1000 : this.Width);
-            double h = this.ActualHeight > 0 ? this.ActualHeight : (double.IsNaN(this.Height) ? 360 : this.Height);
+            double w = TargetWidth;
+            double h = TargetHeight;
 
-            this.Left = waLeft + (waWidth - w) / 2.0;
-            this.Top = waTop + (waHeight - h);
+            TargetLeft = waLeft + (waWidth - w) / 2.0;
+            TargetTop = waTop + (waHeight - h);
 
             ClampToScreen();
         }
@@ -746,8 +808,18 @@ namespace OSK
             catch { }
         }
 
+        private void SetupVirtualScreen()
+        {
+            this.Left = SystemParameters.VirtualScreenLeft;
+            this.Top = SystemParameters.VirtualScreenTop;
+            this.Width = SystemParameters.VirtualScreenWidth;
+            this.Height = SystemParameters.VirtualScreenHeight;
+        }
+
         private void MainWindow_Loaded(object? sender, RoutedEventArgs e)
         {
+            SetupVirtualScreen();
+            
             if (_needsInitialCentering)
             {
                 CenterWindow();
@@ -766,64 +838,182 @@ namespace OSK
 
         private void VisualSyncTimer_Tick(object? sender, EventArgs e)
         {
-            bool physShift = (GetAsyncKeyState(0x10) & 0x8000) != 0;
-            bool physCtrl = (GetAsyncKeyState(0x11) & 0x8000) != 0;
-            bool physAlt = (GetAsyncKeyState(0x12) & 0x8000) != 0;
-            bool physWin = (GetAsyncKeyState(0x5B) & 0x8000) != 0;
-
-            if (physShift)
+            try
             {
-                if (!_lastPhysicalShiftDown)
+                bool physShift = (GetAsyncKeyState(0x10) & 0x8000) != 0;
+                bool physCtrl = (GetAsyncKeyState(0x11) & 0x8000) != 0;
+                bool physAlt = (GetAsyncKeyState(0x12) & 0x8000) != 0;
+                bool physWin = (GetAsyncKeyState(0x5B) & 0x8000) != 0;
+
+                if (physShift)
                 {
-                    _physShiftDownTime = DateTime.Now;
+                    if (!_lastPhysicalShiftDown) _physShiftDownTime = DateTime.Now;
                 }
-            }
-            else
-            {
-                _physShiftDownTime = DateTime.MinValue;
-            }
+                else _physShiftDownTime = DateTime.MinValue;
 
-            _lastPhysicalShiftDown = physShift;
+                _lastPhysicalShiftDown = physShift;
+                _isCapsLockActive = (GetKeyState(0x14) & 0x0001) != 0;
 
-            _isCapsLockActive = (GetKeyState(0x14) & 0x0001) != 0;
+                bool isPhysShiftLongPressed = physShift && (DateTime.Now - _physShiftDownTime).TotalMilliseconds > 200;
+                _isShiftActive = isPhysShiftLongPressed || _virtualShiftToggle;
+                _isCtrlActive = physCtrl || _virtualCtrlToggle;
+                _isAltActive = physAlt || _virtualAltToggle;
+                _isWinActive = physWin || _virtualWinToggle;
+                _isNumLockActive = (GetKeyState(0x90) & 0x0001) != 0;
 
-            // 實體 Shift 視覺延遲邏輯：
-            // 如果按住時間超過 500ms，才視為「啟動 Shift 版面預覽」
-            // 這樣在短點按切換輸入法時，版面就不會跳動閃爍
-            bool isPhysShiftLongPressed = physShift && (DateTime.Now - _physShiftDownTime).TotalMilliseconds > 200;
-            _isShiftActive = isPhysShiftLongPressed || _virtualShiftToggle;
-            _isCtrlActive = physCtrl || _virtualCtrlToggle;
-            _isAltActive = physAlt || _virtualAltToggle;
-            _isWinActive = physWin || _virtualWinToggle;
-            _isNumLockActive = (GetKeyState(0x90) & 0x0001) != 0;
+                // --- 視窗隨動與物理演算邏輯 (包含安全性檢查) ---
+                double curLeft = TargetLeft;
+                double curTop = TargetTop;
 
-            foreach (var row in KeyRows)
-            {
-                foreach (var k in row)
+                // 若視窗位置尚未初始化或為無效值，則跳過隨動計算
+                if (double.IsNaN(curLeft) || double.IsNaN(curTop)) return;
+
+                if (double.IsNaN(_lastWindowLeft))
                 {
-                    if (k.VkCode == MODE_KEY_CODE || k.VkCode == FN_KEY_CODE) continue;
+                    _lastWindowLeft = curLeft;
+                    _lastWindowTop = curTop;
+                }
 
-                    bool isPhysicallyPressed = (GetAsyncKeyState(k.VkCode) & 0x8000) != 0;
+                // 累積位移，捕捉極微小移動防止精度丟失
+                _accumulatedDeltaX += curLeft - _lastWindowLeft;
+                _accumulatedDeltaY += curTop - _lastWindowTop;
+                _lastWindowLeft = curLeft;
+                _lastWindowTop = curTop;
 
-                    if (k.VkCode == 0x10) isPhysicallyPressed = physShift;
-                    else if (k.VkCode == 0x11) isPhysicallyPressed = physCtrl;
-                    else if (k.VkCode == 0x12) isPhysicallyPressed = physAlt;
+                double deltaX = 0;
+                double deltaY = 0;
+                bool hasMoved = false;
 
-                    if (k.IsPressed != isPhysicallyPressed)
+                // 只有累積到一定量才進行物理偏移，優化效能並防止動能瞬間消失
+                if (Math.Abs(_accumulatedDeltaX) > 0.0001 || Math.Abs(_accumulatedDeltaY) > 0.0001)
+                {
+                    deltaX = _accumulatedDeltaX;
+                    deltaY = _accumulatedDeltaY;
+                    _accumulatedDeltaX = 0;
+                    _accumulatedDeltaY = 0;
+                    hasMoved = true;
+                }
+
+                // 拖動會話偵測：當剛開始移動時(從靜止變為移動)，重置所有按鍵參數
+                if (hasMoved && !_isCurrentlyDragging)
+                {
+                    foreach (var row in KeyRows)
                     {
-                        k.IsPressed = isPhysicallyPressed;
+                        if (row == null) continue;
+                        foreach (var k in row) k?.RandomizePhysics();
                     }
                 }
-            }
+                _isCurrentlyDragging = hasMoved;
 
-            _imeCheckCounter++;
-            if (_imeCheckCounter >= 10)
+                double elapsedSec = (DateTime.Now - _lastFrameTime).TotalSeconds;
+                _lastFrameTime = DateTime.Now;
+                
+                // 絕對安全性：限制每一幀的位移量與時間增量
+                if (elapsedSec > 0.1) elapsedSec = 0.03;
+                if (elapsedSec < 0.001) elapsedSec = 0.001; 
+                double timeFactor = elapsedSec / 0.03;
+
+                // 限制單幀最大位移，但把截斷剩餘的量回存累積器，避免大幅移動時動能瞬間消失造成停頓
+                double maxDelta = 150;
+                if (_isDragFxEnabled)
+                {
+                    double clampedX = Math.Clamp(deltaX, -maxDelta, maxDelta);
+                    double clampedY = Math.Clamp(deltaY, -maxDelta, maxDelta);
+                    // 把未被本幀消化的位移回存，讓下一幀繼續處理
+                    _accumulatedDeltaX += deltaX - clampedX;
+                    _accumulatedDeltaY += deltaY - clampedY;
+                    deltaX = clampedX;
+                    deltaY = clampedY;
+                }
+                else
+                {
+                    deltaX = 0;
+                    deltaY = 0;
+                }
+
+                // 物理演算
+                foreach (var row in KeyRows)
+                {
+                    if (row == null) continue;
+                    foreach (var k in row)
+                    {
+                        if (k == null) continue;
+
+                        double offX = k.OffsetX - deltaX;
+                        double offY = k.OffsetY - deltaY;
+
+                        // 防止數值異常 (NaN 與 Infinity 防護)
+                        if (!double.IsFinite(offX)) offX = 0;
+                        if (!double.IsFinite(offY)) offY = 0;
+                        
+                        double velX = k.VelocityX;
+                        double velY = k.VelocityY;
+                        if (!double.IsFinite(velX)) velX = 0;
+                        if (!double.IsFinite(velY)) velY = 0;
+
+                        // 追隨感核心：改進的彈簧阻尼模型
+                        double stiffness = k.FollowSpeed * 0.5; 
+                        
+                        double accelX = (-offX * stiffness) / k.Mass;
+                        double accelY = (-offY * stiffness) / k.Mass;
+                        
+                        velX += accelX * timeFactor;
+                        velY += accelY * timeFactor;
+
+                        velX *= k.Friction;
+                        velY *= k.Friction;
+
+                        offX += velX * timeFactor;
+                        offY += velY * timeFactor;
+
+                        // 只要還在移動，就不要強制歸零，防止「越動越少」
+                        if (!hasMoved)
+                        {
+                            if (Math.Abs(offX) < 0.001 && Math.Abs(velX) < 0.001) { offX = 0; velX = 0; }
+                            if (Math.Abs(offY) < 0.001 && Math.Abs(velY) < 0.001) { offY = 0; velY = 0; }
+                        }
+
+                        // 批量更新，減少 PropertyChanged 觸發次數，防止 WPF 綁定崩潰
+                        if (Math.Abs(k.VelocityX - velX) > 0.0001) k.VelocityX = velX;
+                        if (Math.Abs(k.VelocityY - velY) > 0.0001) k.VelocityY = velY;
+                        if (Math.Abs(k.OffsetX - offX) > 0.001) k.OffsetX = offX;
+                        if (Math.Abs(k.OffsetY - offY) > 0.001) k.OffsetY = offY;
+
+                        // 2. 實體按鍵狀態同步
+                        if (k.VkCode != MODE_KEY_CODE && k.VkCode != FN_KEY_CODE)
+                        {
+                            bool isPressed = (GetAsyncKeyState(k.VkCode) & 0x8000) != 0;
+                            if (k.VkCode == 0x10) isPressed = physShift;
+                            else if (k.VkCode == 0x11) isPressed = physCtrl;
+                            else if (k.VkCode == 0x12) isPressed = physAlt;
+
+                            if (k.IsPressed != isPressed) k.IsPressed = isPressed;
+                        }
+                    }
+                }
+
+                // 僅在狀態真正有變時才更新顯示 (優化效能，防止 UI 管道壅塞並消除字串記憶體配置)
+                int currentStateHash = 
+                    (_isShiftActive ? 1 : 0) |
+                    (_isCapsLockActive ? 2 : 0) |
+                    (_isCtrlActive ? 4 : 0) |
+                    (_isAltActive ? 8 : 0) |
+                    (_isWinActive ? 16 : 0) |
+                    (_isZhuyinMode ? 32 : 0) |
+                    (_virtualFnToggle ? 64 : 0) |
+                    (_temporaryEnglishMode ? 128 : 0);
+
+                if (currentStateHash != _lastDisplayStateHash)
+                {
+                    _lastDisplayStateHash = currentStateHash;
+                    UpdateDisplay();
+                }
+            }
+            catch (Exception ex)
             {
-                _imeCheckCounter = 0;
-                DetectImeStatus();
+                // 記錄或忽略異常以防止閃退
+                System.Diagnostics.Debug.WriteLine($"VisualSyncTimer_Tick Error: {ex.Message}");
             }
-
-            UpdateDisplay();
         }
 
         private void DetectImeStatus()
@@ -1019,8 +1209,8 @@ namespace OSK
                     if (w <= 0) w = (int)(1000 * dpiX / 96.0);
                     if (h <= 0) h = (int)(330 * dpiY / 96.0);
 
-                    int curX = (wp.flags & SWP_NOMOVE) == 0 ? wp.x : (int)(this.Left * dpiX / 96.0);
-                    int curY = (wp.flags & SWP_NOMOVE) == 0 ? wp.y : (int)(this.Top * dpiY / 96.0);
+                    int curX = (wp.flags & SWP_NOMOVE) == 0 ? wp.x : (int)(TargetLeft * dpiX / 96.0);
+                    int curY = (wp.flags & SWP_NOMOVE) == 0 ? wp.y : (int)(TargetTop * dpiY / 96.0);
 
                     // Grab the monitor where this bounds rectangle would land
                     RECT rect = new RECT { left = curX, top = curY, right = curX + w, bottom = curY + h };
@@ -1267,12 +1457,20 @@ namespace OSK
 
         private void ApplyJellyAnimation(UIElement element, double toScaleX, double toScaleY, double durationMs, bool elastic)
         {
-            var transform = element.RenderTransform as ScaleTransform;
-            if (transform == null || element.RenderTransformOrigin.X != 0.5)
+            ScaleTransform? transform = null;
+            if (element.RenderTransform is TransformGroup group)
             {
-                transform = new ScaleTransform(1, 1);
-                element.RenderTransformOrigin = new System.Windows.Point(0.5, 0.5);
-                element.RenderTransform = transform;
+                transform = group.Children.OfType<ScaleTransform>().FirstOrDefault();
+            }
+            if (transform == null)
+            {
+                transform = element.RenderTransform as ScaleTransform;
+                if (transform == null || element.RenderTransformOrigin.X != 0.5)
+                {
+                    transform = new ScaleTransform(1, 1);
+                    element.RenderTransformOrigin = new System.Windows.Point(0.5, 0.5);
+                    element.RenderTransform = transform;
+                }
             }
 
             transform.BeginAnimation(ScaleTransform.ScaleXProperty, null);
@@ -1403,6 +1601,17 @@ namespace OSK
 
         private void Window_PreviewMouseMove(object sender, System.Windows.Input.MouseEventArgs e)
         {
+            if (_isMouseDraggingWindow)
+            {
+                var pos = e.GetPosition(this);
+                double dx = pos.X - _mouseDragStartPoint.X;
+                double dy = pos.Y - _mouseDragStartPoint.Y;
+
+                TargetLeft += dx;
+                TargetTop += dy;
+                _mouseDragStartPoint = pos;
+            }
+
             if (!IsEditMode || _draggedKey == null || _draggedBorder == null) return;
             if (e.StylusDevice != null) return;
 
@@ -1472,6 +1681,13 @@ namespace OSK
 
         private void Window_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
+            if (_isMouseDraggingWindow)
+            {
+                _isMouseDraggingWindow = false;
+                ClampToScreen();
+                Mouse.Capture(null);
+            }
+
             if (!IsEditMode) return;
             if (e.StylusDevice != null) return;
             HandleDrop(e.GetPosition(MainRootGrid));
@@ -2064,11 +2280,11 @@ namespace OSK
                     }
                     else if (key == "Left" && double.TryParse(val, out double left))
                     {
-                        this.Left = left;
+                        TargetLeft = left;
                     }
                     else if (key == "Top" && double.TryParse(val, out double top))
                     {
-                        this.Top = top;
+                        TargetTop = top;
                     }
                     else if (key == "IsFullLayout" && bool.TryParse(val, out bool isFull))
                     {
@@ -2086,15 +2302,12 @@ namespace OSK
                     }
                     else if (key == "Width" && double.TryParse(val, out double w))
                     {
-                        this.Width = w;
-                        double ratio = IsFullLayout ? 0.23 : 0.31;
-                        double minH = Math.Max(w * ratio + 45, 120);
-                        this.MinHeight = minH;
-                        this.MaxHeight = minH;
+                        TargetWidth = w;
                     }
+
                     else if (key == "Height" && double.TryParse(val, out double h))
                     {
-                        this.Height = h;
+                        TargetHeight = h;
                     }
                     else if (key == "IsDarkMode" && bool.TryParse(val, out bool isDark))
                     {
@@ -2221,10 +2434,10 @@ namespace OSK
                 var lines = new List<string>
                 {
                     $"Opacity={this.Opacity}",
-                    $"Width={this.Width}",
-                    $"Height={this.Height}",
-                    $"Left={this.Left}",
-                    $"Top={this.Top}",
+                    $"Width={TargetWidth}",
+                    $"Height={TargetHeight}",
+                    $"Left={TargetLeft}",
+                    $"Top={TargetTop}",
                     $"IsFullLayout={this.IsFullLayout}",
                     $"IsDynamicLayout={this.IsDynamicLayout}",
                     $"IsPinned={_isPinned}",
@@ -2291,16 +2504,14 @@ namespace OSK
 
             if (result != MessageBoxResult.Yes) return;
             // 清除設定檔並恢復所有預設值
-            this.Width = 1000;
+            TargetWidth = 1000;
             if (this.IsFullLayout)
             {
                 ToggleFullLayout(null);
             }
             double ratio = 0.31;
-            double minH = Math.Max(this.Width * ratio + 45, 120);
-            this.MinHeight = minH;
-            this.MaxHeight = minH;
-            this.Height = minH;
+            double minH = Math.Max(TargetWidth * ratio + 45, 120);
+            TargetHeight = minH;
 
             this.Opacity = 1.0;
             this.IsEditMode = false;
@@ -2333,13 +2544,21 @@ namespace OSK
             CenterWindow();
         }
 
+        private bool _isMouseDraggingWindow = false;
+        private System.Windows.Point _mouseDragStartPoint;
+
         private void Window_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
-            // 如果事件來源是觸控/手寫筆，或者是正在觸控拖曳狀態，則不執行 DragMove
             if (e.StylusDevice != null || _isTouchDraggingWindow) return;
+            if (_isResizing) return;
 
-            if (!_isResizing) this.DragMove();
+            // Manual dragging logic for VirtualCanvas
+            _isMouseDraggingWindow = true;
+            _mouseDragStartPoint = e.GetPosition(this);
+            Mouse.Capture((UIElement)sender);
+            e.Handled = true;
         }
+
 
         private void TopTitleBar_TouchDown(object sender, System.Windows.Input.TouchEventArgs e)
         {
@@ -2347,10 +2566,10 @@ namespace OSK
             if (sender is UIElement el)
             {
                 _isTouchDraggingWindow = true;
-                // 記錄在視窗中的相對位置
+                // 記錄在視窗中的絕對位置，避免隨視窗移動而產生無限遞迴的偏移
                 _touchDragStartPoint = e.GetTouchPoint(this).Position;
                 el.CaptureTouch(e.TouchDevice);
-                e.Handled = true; // 阻止向下轉換為滑鼠事件並呼叫 DragMove
+                e.Handled = true; 
             }
         }
 
@@ -2362,9 +2581,12 @@ namespace OSK
                 double dx = pos.X - _touchDragStartPoint.X;
                 double dy = pos.Y - _touchDragStartPoint.Y;
 
-                // 透過位移差調整視窗絕對位置 (此舉會將視窗瞬移，使相對 local 的指標位置回歸原點)
-                this.Left += dx;
-                this.Top += dy;
+                TargetLeft += dx;
+                TargetTop += dy;
+                
+                // 由於 TargetLeft/Top 已經改變，視窗內容也移動了，下次取得的相對 pos 其實會跟著跑。
+                // 因此我們需要不斷更新 _touchDragStartPoint
+                _touchDragStartPoint = pos;
             }
         }
 
@@ -2379,6 +2601,7 @@ namespace OSK
             {
                 _isTouchDraggingWindow = false;
                 if (sender is UIElement el) el.ReleaseTouchCapture(e.TouchDevice);
+                ClampToScreen(); // 確保不會被拖出畫面外
             }
         }
         private void Resize_Init(object sender, MouseButtonEventArgs e) { _isResizing = true; Mouse.Capture((UIElement)sender); }
@@ -2387,22 +2610,26 @@ namespace OSK
         {
             if (_isResizing)
             {
-                System.Windows.Point p = e.GetPosition(this);
-                if (p.X > 200) this.Width = p.X;
+                // 必須相對於 KeyboardContainer 取得滑鼠位置，而非相對於全螢幕的透明 Window
+                // 否則 p.X 可能高達數千像素，使鍵盤瞬間放大到全螢幕
+                System.Windows.Point p = e.GetPosition(KeyboardContainer);
+                if (p.X > 200) TargetWidth = p.X;
 
                 double ratio = _isFullLayout ? 0.23 : 0.31;
-                double minH = Math.Max(this.Width * ratio + 5, 80);
-                this.MinHeight = minH;
-                this.MaxHeight = minH;
-                this.Height = minH;
+                double minH = Math.Max(TargetWidth * ratio + 5, 80);
+                TargetHeight = minH;
             }
         }
 
+
         protected override void OnClosed(EventArgs e)
         {
+            System.Windows.Media.CompositionTarget.Rendering -= VisualSyncTimer_Tick;
             _notifyIcon?.Dispose();
             _inputDetector?.Stop();
-            if (!IsEditMode) SaveSettings(); // 確保關閉時儲存
+            _memoryTrimTimer?.Stop();
+            _imeTimer?.Stop();
+            if (!IsEditMode) SaveSettings();
             base.OnClosed(e);
         }
 
@@ -2499,24 +2726,47 @@ namespace OSK
     public class KeyModel : INotifyPropertyChanged
     {
         private string _english = "";
-        public string English { get { return _english; } set { _english = value; OnPropertyChanged("English"); OnPropertyChanged("EnglishDisp"); } }
+        public string English { get { return _english; } set { if (_english != value) { _english = value; OnPropertyChanged("English"); OnPropertyChanged("EnglishDisp"); } } }
 
         private string _englishUpper = "";
-        public string EnglishUpper { get { return _englishUpper; } set { _englishUpper = value; OnPropertyChanged("EnglishUpper"); OnPropertyChanged("ShiftDisp"); } }
+        public string EnglishUpper { get { return _englishUpper; } set { if (_englishUpper != value) { _englishUpper = value; OnPropertyChanged("EnglishUpper"); OnPropertyChanged("ShiftDisp"); } } }
 
         private string _zhuyin = "";
-        public string Zhuyin { get { return _zhuyin; } set { _zhuyin = value; OnPropertyChanged("Zhuyin"); OnPropertyChanged("ZhuyinDisp"); } }
+        public string Zhuyin { get { return _zhuyin; } set { if (_zhuyin != value) { _zhuyin = value; OnPropertyChanged("Zhuyin"); OnPropertyChanged("ZhuyinDisp"); } } }
 
         private string _fnText = "";
-        public string FnText { get { return _fnText; } set { _fnText = value; OnPropertyChanged("FnText"); OnPropertyChanged("FnDisp"); } }
+        public string FnText { get { return _fnText; } set { if (_fnText != value) { _fnText = value; OnPropertyChanged("FnText"); OnPropertyChanged("FnDisp"); } } }
 
         private string _displayName = "";
-        public string DisplayName { get { return _displayName; } set { _displayName = value; OnPropertyChanged("DisplayName"); } }
+        public string DisplayName { get { return _displayName; } set { if (_displayName != value) { _displayName = value; OnPropertyChanged("DisplayName"); } } }
 
         private string _dynamicTextColor = "White";
-        public string DynamicTextColor { get { return _dynamicTextColor; } set { _dynamicTextColor = value; OnPropertyChanged("DynamicTextColor"); } }
+        public string DynamicTextColor { get { return _dynamicTextColor; } set { if (_dynamicTextColor != value) { _dynamicTextColor = value; OnPropertyChanged("DynamicTextColor"); } } }
 
         public byte VkCode { get; set; }
+        private static readonly Random _rnd = new();
+
+        // 動態隨動屬性
+        private double _offsetX = 0;
+        public double OffsetX { get => _offsetX; set { if (_offsetX != value) { _offsetX = value; OnPropertyChanged(nameof(OffsetX)); } } }
+
+        private double _offsetY = 0;
+        public double OffsetY { get => _offsetY; set { if (_offsetY != value) { _offsetY = value; OnPropertyChanged(nameof(OffsetY)); } } }
+
+        public double VelocityX { get; set; } = 0;
+        public double VelocityY { get; set; } = 0;
+        public double FollowSpeed { get; set; } = 0.2 + _rnd.NextDouble() * 0.3; // 0.2 ~ 0.5 (穩定追隨)
+        public double Friction { get; set; } = 0.5 + _rnd.NextDouble() * 0.15;   // 強阻尼 (0.5 ~ 0.65) 消除擺動
+        public double NoisePhase { get; set; } = _rnd.NextDouble() * Math.PI * 2;
+        public double Mass { get; set; } = 1.0 + _rnd.NextDouble() * 0.5;         // 增加質量 (1.0 ~ 1.5) 提高穩定性
+
+        public void RandomizePhysics()
+        {
+            FollowSpeed = 0.2 + _rnd.NextDouble() * 0.3;
+            Friction = 0.5 + _rnd.NextDouble() * 0.15;
+            Mass = 1.0 + _rnd.NextDouble() * 0.5;
+            NoisePhase = _rnd.NextDouble() * Math.PI * 2;
+        }
 
         private double _width = 65;
         public double Width
@@ -2540,8 +2790,11 @@ namespace OSK
             get => _height;
             set
             {
-                _height = value;
-                OnPropertyChanged(nameof(Height));
+                if (_height != value)
+                {
+                    _height = value;
+                    OnPropertyChanged(nameof(Height));
+                }
             }
         }
 
@@ -2551,9 +2804,12 @@ namespace OSK
             get => _leftMargin;
             set
             {
-                _leftMargin = value;
-                OnPropertyChanged(nameof(LeftMargin));
-                OnPropertyChanged(nameof(Margin));
+                if (_leftMargin != value)
+                {
+                    _leftMargin = value;
+                    OnPropertyChanged(nameof(LeftMargin));
+                    OnPropertyChanged(nameof(Margin));
+                }
             }
         }
 
@@ -2563,9 +2819,12 @@ namespace OSK
             get => _topMargin;
             set
             {
-                _topMargin = value;
-                OnPropertyChanged(nameof(TopMargin));
-                OnPropertyChanged(nameof(Margin));
+                if (_topMargin != value)
+                {
+                    _topMargin = value;
+                    OnPropertyChanged(nameof(TopMargin));
+                    OnPropertyChanged(nameof(Margin));
+                }
             }
         }
 

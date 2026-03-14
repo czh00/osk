@@ -4,8 +4,9 @@
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         Title="OSK" Height="330" Width="1000" 
         Topmost="True" WindowStyle="None" AllowsTransparency="True" ShowInTaskbar="False"
-        Background="Transparent" 
+        Background="{x:Null}" 
         Stylus.IsPressAndHoldEnabled="False" Stylus.IsFlicksEnabled="False" Stylus.IsTapFeedbackEnabled="False"
+
         Stylus.IsTouchFeedbackEnabled="False"
         ResizeMode="NoResize" Name="RootWindow"
         PreviewMouseMove="Window_PreviewMouseMove"
@@ -18,14 +19,17 @@
     </shell:WindowChrome.WindowChrome>
     <Window.Resources>
     </Window.Resources>
-    <Border CornerRadius="10" Background="{Binding WindowBackground}" ClipToBounds="True">
-        <Grid x:Name="MainRootGrid" Background="Transparent" ClipToBounds="True">
-            <!-- 右下角 Resize Grip：綁定 ResizeGripColor -->
-        <Grid VerticalAlignment="Bottom" HorizontalAlignment="Right" Width="25" Height="25" Cursor="SizeNWSE" MouseLeftButtonDown="Resize_Init" MouseMove="Resize_Move" MouseLeftButtonUp="Resize_End" Panel.ZIndex="100" Background="Transparent">
-            <Path Data="M0,25 L25,25 L25,0 Z" Fill="{Binding ResizeGripColor}"/>
-            <Path Data="M10,25 L25,10 M15,25 L25,15 M20,25 L25,20" Stroke="{Binding ResizeGripColor}" StrokeThickness="1"/>
-        </Grid>
-        <Grid Margin="1,1,1,0" Background="Transparent">
+    
+    <!-- VirtualScreen Canvas allowing full unbounded movement -->
+    <Canvas x:Name="VirtualCanvas" Background="{x:Null}">
+        <Border x:Name="KeyboardContainer" CornerRadius="10" Background="{Binding WindowBackground}" ClipToBounds="False">
+            <Grid x:Name="MainRootGrid" Background="Transparent" ClipToBounds="False">
+                <!-- 右下角 Resize Grip：綁定 ResizeGripColor -->
+            <Grid VerticalAlignment="Bottom" HorizontalAlignment="Right" Width="25" Height="25" Cursor="SizeNWSE" MouseLeftButtonDown="Resize_Init" MouseMove="Resize_Move" MouseLeftButtonUp="Resize_End" Panel.ZIndex="100" Background="Transparent" Visibility="{Binding ResizeGripVisibility}">
+                <Path Data="M0,25 L25,25 L25,0 Z" Fill="{Binding ResizeGripColor}"/>
+                <Path Data="M10,25 L25,10 M15,25 L25,15 M20,25 L25,20" Stroke="{Binding ResizeGripColor}" StrokeThickness="1"/>
+            </Grid>
+            <Grid Margin="1,1,1,0" Background="Transparent">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
@@ -73,6 +77,16 @@
                             FontSize="16"
                             Margin="0,0,5,0"
                             ToolTip="釘住 / 取消釘住鍵盤 (開啟時不會隨焦點隱藏)" />
+                            
+                    <!-- 拖移特效開關按鈕 -->
+                    <Button Command="{Binding ToggleDragFxCommand}" 
+                            Content="{Binding DragFxIcon}"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            Foreground="{Binding UiTextColor}"
+                            FontSize="16"
+                            Margin="0,0,5,0"
+                            ToolTip="開關拖移物理特效" />
                             
                     <!-- 主題切換按鈕：綁定 UiTextColor -->
                     <Button Command="{Binding ToggleThemeCommand}" 
@@ -155,7 +169,13 @@
                                                 TouchUp="KeyBorder_TouchUp"
                                                 TouchLeave="KeyBorder_TouchLeave"
                                                 PreviewMouseLeftButtonDown="KeyBorder_PreviewMouseLeftButtonDown"
-                                                PreviewTouchDown="KeyBorder_PreviewTouchDown">
+                                                 PreviewTouchDown="KeyBorder_PreviewTouchDown">
+                                            <Border.RenderTransform>
+                                                <TransformGroup>
+                                                    <TranslateTransform X="{Binding OffsetX}" Y="{Binding OffsetY}" />
+                                                    <ScaleTransform ScaleX="1" ScaleY="1" />
+                                                </TransformGroup>
+                                            </Border.RenderTransform>
                                             <Border.Style>
                                                 <Style TargetType="Border">
                                                     <Style.Triggers>
@@ -216,6 +236,7 @@
                 </Grid>
             </Viewbox>
         </Grid>
-        </Grid>
-    </Border>
+            </Grid>
+        </Border>
+    </Canvas>
 </Window>
