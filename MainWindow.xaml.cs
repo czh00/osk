@@ -620,25 +620,41 @@ namespace OSK
             OnPropertyChanged("DragFxIcon");
         }
 
-        private void TogglePin(object? parameter)
+        private void ApplyPinState(bool pinned)
         {
-            _isPinned = !_isPinned;
+            _isPinned = pinned;
             OnPropertyChanged("PinIcon");
+            this.Topmost = pinned;
 
             if (_inputDetector != null)
             {
-                if (_isPinned)
+                if (pinned)
+                {
                     _inputDetector.Stop();
+                    this.Show(); // 確保固定後可見
+                }
                 else
+                {
                     _inputDetector.Start();
+                }
             }
+        }
+
+        private void ApplyLayoutType(bool dynamic)
+        {
+            IsDynamicLayout = dynamic;
+            LayoutIcon = dynamic ? "🗔" : "🗖";
+            UpdateDisplay();
+        }
+
+        private void TogglePin(object? parameter)
+        {
+            ApplyPinState(!_isPinned);
         }
 
         private void ToggleLayout(object? parameter)
         {
-            IsDynamicLayout = !IsDynamicLayout;
-            LayoutIcon = IsDynamicLayout ? "🗔" : "🗖";
-            UpdateDisplay();
+            ApplyLayoutType(!IsDynamicLayout);
         }
 
         private void ToggleFullLayout(object? parameter)
@@ -2717,8 +2733,8 @@ namespace OSK
                         {
                             _isSystemOskActive = false; // 取消抑制標記
                             
-                            // [需求恢復] 恢復原本的釘選狀態
-                            _isPinned = _savedPinnedStateBeforeSystemOsk;
+                            // [關鍵修復] 使用統一方法恢復原本的釘選狀態
+                            ApplyPinState(_savedPinnedStateBeforeSystemOsk);
                             OnPropertyChanged("PinIcon");
 
                             // [恢復] 重新啟動偵測器 (僅在非釘選狀態下啟動)
@@ -2740,8 +2756,7 @@ namespace OSK
             catch (Exception ex)
             {
                 _isSystemOskActive = false;
-                _isPinned = _savedPinnedStateBeforeSystemOsk;
-                OnPropertyChanged("PinIcon");
+                ApplyPinState(_savedPinnedStateBeforeSystemOsk);
                 this.Show();
                 System.Windows.MessageBox.Show($"無法啟動內建虛擬鍵盤 [{ex.Message}]", "錯誤", MessageBoxButton.OK, MessageBoxImage.Error);
             }
@@ -2757,12 +2772,12 @@ namespace OSK
                 MessageBoxResult.No);
 
             if (result != MessageBoxResult.Yes) return;
-            // 清除設定檔並恢復所有預設值
+
+            // [效能優化] 移除冗餘的 ToggleFullLayout 呼叫，直接在下方統一處理初始化
+            _isFullLayout = false; // 強制設為精簡版面
+            FullLayoutIcon = "⌨";
+
             TargetWidth = 1000;
-            if (this.IsFullLayout)
-            {
-                ToggleFullLayout(null);
-            }
             double ratio = 0.31;
             double minH = Math.Max(TargetWidth * ratio + 45, 120);
             TargetHeight = minH;
@@ -2770,11 +2785,13 @@ namespace OSK
             this.Opacity = 1.0;
             this.IsEditMode = false;
 
-            _isPinned = true;
-            OnPropertyChanged("PinIcon");
-            this.Topmost = true; // 預設為 true
+            // [關鍵修復] 使用統一方法重置圖釘與佈局狀態
+            ApplyPinState(true);
+            ApplyLayoutType(true);
 
-            this.IsDynamicLayout = true; // 預設為 true
+            // [新增] 重置物理特效
+            _isDragFxEnabled = true;
+            OnPropertyChanged("DragFxIcon");
 
             // 恢復顏色為系統預設
             DetectSystemTheme();
@@ -2787,9 +2804,9 @@ namespace OSK
                 try { File.Delete(_iniFilePath); } catch { }
             }
 
+            // [效能優化] 統一執行一次清空與建立
             KeyRows.Clear();
-            if (IsFullLayout) SetupFullKeyboard();
-            else SetupKeyboard();
+            SetupKeyboard();
 
             KeyBoardItemsControl.ItemsSource = null;
             KeyBoardItemsControl.ItemsSource = KeyRows;

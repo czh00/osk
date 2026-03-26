@@ -125,7 +125,10 @@ namespace OSK
                 if (handler != null)
                 {
                     _focusHandler = null; 
-                    try { Automation.RemoveAutomationFocusChangedEventHandler(handler); } catch { }
+                    // [效能優化] UIA 註銷操作在部分環境極其緩慢，改為非同步執行避免阻塞 UI 執行緒 (解決重置卡頓)
+                    System.Threading.Tasks.Task.Run(() => {
+                        try { Automation.RemoveAutomationFocusChangedEventHandler(handler); } catch { }
+                    });
                 }
             }
             else

@@ -2,7 +2,10 @@
 
 > 一款專為 Windows 打造的**羽量級、全功能、動態可視化**虛擬螢幕鍵盤，支援物理鍵盤同步、注音輸入法偵測、自訂版面與流體動畫特效。
 
----
+<img width="1503" height="532" alt="image" src="https://github.com/user-attachments/assets/a82fd8f2-e670-4153-883e-ab1809dfe1a4" />
+<img width="1509" height="539" alt="image" src="https://github.com/user-attachments/assets/3cde6b76-0c0b-4ea7-90d9-4ab3a1ae3500" />
+<img width="1503" height="552" alt="image" src="https://github.com/user-attachments/assets/cff9fd65-ff6c-4f5a-a7a5-c8331eadbb09" />
+
 
 ## 🌟 核心特色
 
