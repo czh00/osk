@@ -4,19 +4,26 @@ using System.Windows;
 using System.Windows.Automation;
 using System.Runtime.InteropServices;
 using System.Windows.Threading;
+using System.Text;
+using System.IO;
 
 namespace OSK
 {
     /// <summary>
-    /// 全域輸入焦點偵測器 (精準判定與自動隱藏修正版)
-    /// 修正：檔案總管完成輸入後不自動隱藏、FB/IG 圖片誤觸發問題。
+    /// 全域輸入焦點偵測器 (診斷強化版)
+    /// 加入實體日誌以追蹤管理員視窗判定失敗的原因。
     /// </summary>
     public class InputDetector
     {
         private readonly Window _keyboardWindow;
         private AutomationFocusChangedEventHandler? _focusHandler;
-        private DispatcherTimer _caretCheckTimer;
+        private DispatcherTimer _backupTimer;
         private bool _isCurrentInputActive = false;
+        private readonly int _currentProcessId;
+        
+        private IntPtr _hWinEventHook;
+        private WinEventProc _winEventDelegate;
+        private string _logPath;
 
         #region Win32 API
         [StructLayout(LayoutKind.Sequential)]
@@ -45,78 +52,156 @@ namespace OSK
         [DllImport("user32.dll")]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventProc lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        private delegate void WinEventProc(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+
+        private const uint WINEVENT_OUTOFCONTEXT = 0;
+        private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
         private const int GUI_CARETBLINKING = 0x00000001;
         #endregion
 
         public InputDetector(Window keyboardWindow)
         {
             _keyboardWindow = keyboardWindow;
+            using (var proc = Process.GetCurrentProcess())
+            {
+                _currentProcessId = proc.Id;
+            }
             
-            _caretCheckTimer = new DispatcherTimer();
-            _caretCheckTimer.Interval = TimeSpan.FromMilliseconds(400); // 略微調快偵測頻率
-            _caretCheckTimer.Tick += CaretCheckTimer_Tick;
+            _logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "osk_debug.log");
+            
+            _backupTimer = new DispatcherTimer();
+            _backupTimer.Interval = TimeSpan.FromMilliseconds(500);
+            _backupTimer.Tick += (s, e) => CheckForegroundAndCaret("Timer");
+
+            _winEventDelegate = new WinEventProc(WinEventCallback);
+        }
+
+        private void Log(string message)
+        {
+            try
+            {
+                File.AppendAllText(_logPath, $"{DateTime.Now:HH:mm:ss.fff} {message}\n");
+            }
+            catch { }
         }
 
         public void Start()
         {
+            if (_focusHandler != null) return; // 避免重複啟動導致掛鉤重疊
+
+            Log("--- Detection Started ---");
             try
             {
                 _focusHandler = new AutomationFocusChangedEventHandler(OnFocusChanged);
                 Automation.AddAutomationFocusChangedEventHandler(_focusHandler);
-                _caretCheckTimer.Start();
-                Debug.WriteLine("[OSK] 輸入偵測啟動...");
+
+                _hWinEventHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, _winEventDelegate, 0, 0, WINEVENT_OUTOFCONTEXT);
+                
+                _backupTimer.Start();
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[OSK] 啟動失敗: {ex.Message}");
-            }
-        }
-
-        public void Stop()
-        {
-            if (_focusHandler != null)
-            {
-                Automation.RemoveAutomationFocusChangedEventHandler(_focusHandler);
+                Log($"Start Failed: {ex.Message}");
                 _focusHandler = null;
             }
-            _caretCheckTimer.Stop();
         }
 
-        /// <summary>
-        /// 定時檢查系統是否有閃爍游標，這對於解決檔案總管完成輸入後隱藏非常重要。
-        /// </summary>
-        private void CaretCheckTimer_Tick(object? sender, EventArgs e)
+        public void Stop(bool isShuttingDown = false)
         {
-            GUITHREADINFO gui = new GUITHREADINFO();
-            gui.cbSize = Marshal.SizeOf(gui);
-
-            if (GetGUIThreadInfo(0, ref gui))
+            // [關鍵優化] 關閉程式時，UIA 的 Remove 操作極易因為 COM 狀態而導致執行緒掛死
+            // 如果是正在關閉進程，我們跳過 UIA 註銷，讓作業系統在進程結束時統一回收
+            if (!isShuttingDown)
             {
-                // 檢查是否有實體 Caret 或正在閃爍
-                bool hasCaret = gui.hwndCaret != IntPtr.Zero || (gui.flags & GUI_CARETBLINKING) != 0;
-
-                if (hasCaret)
+                var handler = _focusHandler;
+                if (handler != null)
                 {
-                    uint pid;
-                    GetWindowThreadProcessId(GetForegroundWindow(), out pid);
-                    if (pid == Process.GetCurrentProcess().Id) return;
+                    _focusHandler = null; 
+                    try { Automation.RemoveAutomationFocusChangedEventHandler(handler); } catch { }
+                }
+            }
+            else
+            {
+                _focusHandler = null; // 標記為空即可
+            }
 
-                    _isCurrentInputActive = true;
-                    ShowKeyboard();
+            if (_hWinEventHook != IntPtr.Zero)
+            {
+                UnhookWinEvent(_hWinEventHook);
+                _hWinEventHook = IntPtr.Zero;
+            }
+            _backupTimer.Stop();
+            Log("--- Detection Stopped ---");
+        }
+
+        private void WinEventCallback(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
+        {
+            CheckForegroundAndCaret("WinEvent");
+        }
+
+        private void CheckForegroundAndCaret(string source)
+        {
+            if (_keyboardWindow is MainWindow mw && mw.IsBusySuppressing) return;
+
+            IntPtr hFore = GetForegroundWindow();
+            if (hFore == IntPtr.Zero) return;
+
+            uint pid;
+            uint tid = GetWindowThreadProcessId(hFore, out pid);
+            if (pid == (uint)_currentProcessId) return;
+
+            var className = new StringBuilder(256);
+            GetClassName(hFore, className, className.Capacity);
+            string cls = className.ToString();
+            string clsLower = cls.ToLower();
+
+            // 如果是管理員視窗類別，強制狀態為 Active (包含 Windows Terminal 的 CASCADIA_HOSTING_WINDOW_CLASS)
+            if (clsLower.Contains("terminal") || clsLower.Contains("console") || 
+                clsLower.Contains("cmd") || clsLower.Contains("powershell") || clsLower.Contains("cascadia"))
+            {
+                Log($"[{source}] Admin Window Detected: {cls}");
+                UpdateState(true);
+                return;
+            }
+
+            // 標準 Win32 Caret 偵測
+            GUITHREADINFO gui = new GUITHREADINFO();
+            gui.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+            if (GetGUIThreadInfo(tid, ref gui))
+            {
+                if (gui.hwndCaret != IntPtr.Zero || (gui.flags & GUI_CARETBLINKING) != 0)
+                {
+                    Log($"[{source}] Caret Detected in: {cls}");
+                    UpdateState(true);
                 }
                 else
                 {
-                    // 如果 UIA 焦點目前也不在輸入區，則根據 Caret 消失來隱藏鍵盤
-                    if (!_isCurrentInputActive)
+                    if (clsLower.Contains("progman") || clsLower.Contains("workerw"))
                     {
-                        HideKeyboard();
+                        Log($"[{source}] Desktop Detected, Hiding.");
+                        UpdateState(false);
                     }
                 }
+            }
+            else
+            {
+                // 如果 GetGUIThreadInfo 失敗 (通常是提權視窗)，但類別沒被上面軌道抓到
+                Log($"[{source}] GUI Info Failed for: {cls} (PID: {pid})");
             }
         }
 
         private void OnFocusChanged(object sender, AutomationFocusChangedEventArgs e)
         {
+            if (_keyboardWindow is MainWindow mw && mw.IsBusySuppressing) return;
+
             try
             {
                 if (sender is AutomationElement element)
@@ -124,111 +209,59 @@ namespace OSK
                     var current = element.Current;
                     var controlType = current.ControlType;
                     var className = current.ClassName ?? "";
-                    var name = current.Name ?? "";
-
-                    // 1. 系統組件過濾 (排除開始功能表、工作列)
-                    if (className.Contains("Shell_") || className.Contains("Tray") || name == "開始" || name == "Search")
+                    
+                    if (className.Contains("Shell_") || className.Contains("Tray"))
                     {
-                        _isCurrentInputActive = false;
-                        HideKeyboard();
-                        return;
-                    }
-
-                    // 2. 狀態檢查
-                    if (!current.IsEnabled || current.IsOffscreen)
-                    {
-                        _isCurrentInputActive = false;
-                        HideKeyboard();
+                        UpdateState(false);
                         return;
                     }
 
                     bool isInputArea = false;
-
-                    // 3. 判定邏輯
                     if (current.IsPassword || controlType == ControlType.Edit || controlType == ControlType.ComboBox)
                     {
                         isInputArea = true;
                     }
                     else if (controlType == ControlType.Document)
                     {
-                        // 處理瀏覽器/社群網站，檢查是否唯讀
                         if (element.TryGetCurrentPattern(ValuePattern.Pattern, out object vp))
                         {
-                            var valPattern = (ValuePattern)vp;
-                            if (!valPattern.Current.IsReadOnly) isInputArea = true;
-                        }
-                        else if (element.TryGetCurrentPattern(TextPattern.Pattern, out _) && current.IsKeyboardFocusable)
-                        {
-                            if (!name.Contains("圖片") && !name.Contains("Photo"))
-                            {
-                                isInputArea = true;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // 針對 LINE 或 wxMedit 等非標準 UI
-                        if (element.TryGetCurrentPattern(ValuePattern.Pattern, out object p))
-                        {
-                            var vp = (ValuePattern)p;
-                            if (!vp.Current.IsReadOnly && current.IsKeyboardFocusable)
-                            {
-                                isInputArea = true;
-                            }
+                            if (!((ValuePattern)vp).Current.IsReadOnly) isInputArea = true;
                         }
                     }
 
-                    _isCurrentInputActive = isInputArea;
-
-                    if (isInputArea)
-                    {
-                        uint pid;
-                        GetWindowThreadProcessId(GetForegroundWindow(), out pid);
-                        if (pid == Process.GetCurrentProcess().Id) return;
-
-                        ShowKeyboard();
-                    }
-                    else
-                    {
-                        // 當焦點移動到非輸入區(例如檔案總管的空白處)，執行隱藏
-                        HideKeyboard();
-                    }
+                    if (isInputArea) Log($"[UIA] Input Area: {controlType.ProgrammaticName} in {className}");
+                    UpdateState(isInputArea);
                 }
             }
-            catch (ElementNotAvailableException) 
+            catch (Exception)
             {
-                // 當元素消失時（如檔案總管完成重新命名），視為需要隱藏
-                _isCurrentInputActive = false;
-                HideKeyboard();
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"[OSK] UIA 錯誤: {ex.Message}");
+                // UIA 跨進程失敗很正常，不記日誌以免刷屏
             }
         }
 
-        private void ShowKeyboard()
+        private void UpdateState(bool active)
         {
+            _isCurrentInputActive = active;
             _keyboardWindow.Dispatcher.BeginInvoke(new Action(() =>
             {
-                if (_keyboardWindow.Visibility != Visibility.Visible)
+                if (active)
                 {
-                    _keyboardWindow.Show();
+                    if (_keyboardWindow.Visibility != Visibility.Visible)
+                    {
+                        _keyboardWindow.Show();
+                        Log("-> Keyboard Show");
+                    }
+                    if (_keyboardWindow.WindowState == WindowState.Minimized)
+                        _keyboardWindow.WindowState = WindowState.Normal;
+                    _keyboardWindow.Topmost = true;
                 }
-                if (_keyboardWindow.WindowState == WindowState.Minimized)
-                    _keyboardWindow.WindowState = WindowState.Normal;
-                
-                _keyboardWindow.Topmost = true;
-            }), DispatcherPriority.Input);
-        }
-
-        private void HideKeyboard()
-        {
-            _keyboardWindow.Dispatcher.BeginInvoke(new Action(() =>
-            {
-                if (_keyboardWindow.Visibility == Visibility.Visible)
+                else
                 {
-                    _keyboardWindow.Hide();
+                    if (_keyboardWindow.Visibility == Visibility.Visible)
+                    {
+                        _keyboardWindow.Hide();
+                        Log("-> Keyboard Hide");
+                    }
                 }
             }), DispatcherPriority.Input);
         }

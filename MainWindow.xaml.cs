@@ -16,6 +16,7 @@ using System.Windows.Media.Animation;
 using System.Reflection;
 using System.IO;
 using Microsoft.Win32;
+using System.Diagnostics;
 
 namespace OSK
 {
@@ -77,6 +78,8 @@ namespace OSK
 
         private const int INPUT_KEYBOARD = 1;
         private const uint KEYEVENTF_KEYUP = 0x0002;
+        private const uint KEYEVENTF_SCANCODE = 0x0008;
+        private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
         // ---------------------------------
 
         [DllImport("user32.dll")] private static extern uint RegisterWindowMessage(string lpString);
@@ -84,6 +87,7 @@ namespace OSK
         [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vKey);
         [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("user32.dll")] private static extern uint MapVirtualKey(uint uCode, uint uMapType);
 
         // 系統操作 API
         [DllImport("user32.dll", SetLastError = true)] private static extern bool LockWorkStation();
@@ -141,6 +145,21 @@ namespace OSK
 
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+        
+        [DllImport("user32.dll")]
+        private static extern int GetSystemMetrics(int nIndex);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromPoint(System.Drawing.Point pt, uint dwFlags);
+
+        [DllImport("shcore.dll")]
+        private static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
+
+        private const int MONITOR_DEFAULTTONEAREST = 2;
+        private const int MDT_EFFECTIVE_DPI = 0;
 
         private const int DWMWA_TRANSITIONS_FORCEDISABLED = 3;
         private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
@@ -182,7 +201,7 @@ namespace OSK
         public string PinIcon { get { return _isPinned ? "📍" : "📌"; } }
 
         private bool _isDragFxEnabled = true;
-        public string DragFxIcon { get { return _isDragFxEnabled ? "🌊" : "⬛"; } }
+        public string DragFxIcon { get { return _isDragFxEnabled ? "❄️" : "🌊"; } }
 
         private bool _isEditMode = false;
         public bool IsEditMode { get { return _isEditMode; } set { _isEditMode = value; OnPropertyChanged("IsEditMode"); OnPropertyChanged("SettingsBtnColor"); } }
@@ -226,6 +245,10 @@ namespace OSK
         private string _currentAppInfo = "OSK (讀取中...)";
         public string CurrentAppInfo { get { return _currentAppInfo; } set { _currentAppInfo = value; OnPropertyChanged("CurrentAppInfo"); } }
         private string _lastLoggedAppInfo = "";
+        private uint _lastPid = 0;
+        private string? _lastProcessName = null;
+        private int _clipboardCheckCounter = 0;
+        private string _lastClipboardText = "";
 
         // 本地虛擬 modifier
         private bool _virtualShiftToggle = false;
@@ -346,6 +369,13 @@ namespace OSK
         private double _lastWindowTop = double.NaN;
         private DateTime _lastFrameTime = DateTime.Now;
         private bool _isCurrentlyDragging = false;
+        private bool _isPhysicsActive = false; // 按鍵是否正在物理運動中 (包括拖曳後的歸位動畫)
+        
+        // [強化] 綜合所有繁忙狀態：物理動畫中、滑鼠拖動中、觸控拖動中、縮放中，以及系統 OSK 叫出中
+        private bool _isSystemOskActive = false;
+        public bool IsBusySuppressing => _isPhysicsActive || _isMouseDraggingWindow || _isTouchDraggingWindow || _isResizing || _isSystemOskActive;
+        private bool _wasBusySuppressing = false; 
+        public bool IsPhysicsActive => _isPhysicsActive;
         private int _lastDisplayStateHash = -1; 
         private double _accumulatedDeltaX = 0; // 位移累積器，捕捉極微小位移
         private double _accumulatedDeltaY = 0;
@@ -357,7 +387,7 @@ namespace OSK
             set
             {
                 Canvas.SetLeft(KeyboardContainer, value - SystemParameters.VirtualScreenLeft);
-                SaveSettings();
+                // [優化] 拖曳中不進行磁碟寫入，移至 MouseUp/TouchUp 執行
             }
         }
 
@@ -367,7 +397,7 @@ namespace OSK
             set
             {
                 Canvas.SetTop(KeyboardContainer, value - SystemParameters.VirtualScreenTop);
-                SaveSettings();
+                // [優化] 拖曳中不進行磁碟寫入，移至 MouseUp/TouchUp 執行
             }
         }
 
@@ -385,18 +415,14 @@ namespace OSK
 
         #endregion
 
-        // 將特定按鍵加入到 User32 SendInput 結構清單中
+        // 將特定按鍵加入到 User32 SendInput 結構清單中 (高相容性版)
         private void AddKeyInput(List<INPUT> inputs, byte vk, bool keyUp)
         {
-            uint flags = keyUp ? KEYEVENTF_KEYUP : 0;
-            // 針對擴展鍵 (Extended Key) 加入 0x0001 旗標，確保 Windows 能正確識別左右鍵或特殊鍵 (如方向鍵、NumLock)
-            if (vk == 0x90 || vk == 0x21 || vk == 0x22 || vk == 0x23 || vk == 0x24 ||
-                vk == 0x25 || vk == 0x26 || vk == 0x27 || vk == 0x28 || vk == 0x2D ||
-                vk == 0x2E || vk == 0xA1 || vk == 0xA3 || vk == 0xA5 || vk == 0x5B || vk == 0x5C || vk == 0x6F ||
-                vk == 0xAD || vk == 0xAE || vk == 0xAF)
-            {
-                flags |= 0x0001;
-            }
+            ushort scanCode = (ushort)MapVirtualKey(vk, 0); // MAPVK_VK_TO_VSC = 0
+            uint flags = (keyUp ? KEYEVENTF_KEYUP : 0);
+
+            // 針對擴展鍵 (Extended Key) 加入旗標，確保 Windows 與遠端桌面 (Splashtop) 正確識別
+            if (IsExtendedKey(vk)) flags |= KEYEVENTF_EXTENDEDKEY;
 
             var input = new INPUT
             {
@@ -405,9 +431,9 @@ namespace OSK
                 {
                     ki = new KEYBDINPUT
                     {
-                        wVk = vk,
-                        wScan = 0,
-                        dwFlags = flags,
+                        wVk = vk,         // 同時保留虛擬鍵
+                        wScan = scanCode, // 同時保留掃描碼 (提高 AHK 風格相容性)
+                        dwFlags = flags,  // 預設不強制 KEYEVENTF_SCANCODE，讓系統自行處理
                         time = 0,
                         dwExtraInfo = IntPtr.Zero
                     }
@@ -416,12 +442,20 @@ namespace OSK
             inputs.Add(input);
         }
 
+        private bool IsExtendedKey(byte vk)
+        {
+            // 常見擴展鍵：方向鍵、Home/End、PageUp/Down、Ins/Del、左右 Alt/Ctrl 等
+            // 注意：NumLock (0x90) 通常不屬於擴展鍵，移除它以避免相容性問題
+            return (vk >= 0x21 && vk <= 0x2E) || (vk >= 0x25 && vk <= 0x28) || 
+                   (vk == 0xA1 || vk == 0xA3 || vk == 0xA5) || (vk == 0x5B || vk == 0x5C);
+        }
+
         // 傳送單一按鍵的按下或放開事件
         private void SendSimulatedKey(byte vk, bool isKeyUp)
         {
             var list = new List<INPUT>();
             AddKeyInput(list, vk, isKeyUp);
-            SendInput((uint)list.Count, list.ToArray(), INPUT.Size);
+            SendInput((uint)list.Count, list.ToArray(), Marshal.SizeOf(typeof(INPUT)));
         }
 
         // 清除所有虛擬修飾鍵的暫存狀態
@@ -476,6 +510,11 @@ namespace OSK
 
             SetupKeyboard();
 
+            // [修正] 確保在讀取 INI 前有預設尺寸，防止 NaN 產生
+            TargetWidth = 1000;
+            double ratio = IsFullLayout ? 0.23 : 0.31;
+            TargetHeight = Math.Max(TargetWidth * ratio + 45, 120);
+
             // 如果沒有 INI 設定檔，首次啟動應預設置中並靠下
             if (!File.Exists(_iniFilePath))
             {
@@ -528,7 +567,7 @@ namespace OSK
 
 
             _memoryTrimTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
-            _memoryTrimTimer.Tick += (s, e) => { ReduceMemoryUsage(); };
+            _memoryTrimTimer.Tick += (s, e) => { if (!_isPhysicsActive) ReduceMemoryUsage(); };
             _memoryTrimTimer.Start();
 
             // IME 檢測移至獨立的慢速計時器，避免每幀都呼叫昂貴的 Win32 API
@@ -539,7 +578,10 @@ namespace OSK
             _inputDetector = new InputDetector(this);
             if (!_isPinned)
             {
-                _inputDetector.Start();
+                // [優化] 異步啟動偵測器，防止 UIAutomation 初始化阻塞主執行緒導致啟動緩慢
+                Dispatcher.BeginInvoke(new Action(() => {
+                    _inputDetector.Start();
+                }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
             }
         }
 
@@ -736,30 +778,56 @@ namespace OSK
                 var screen = System.Windows.Forms.Screen.FromPoint(cursorPos);
                 var wa = screen.WorkingArea;
 
-                var source = PresentationSource.FromVisual(this);
-                Matrix transform = Matrix.Identity;
-                if (source?.CompositionTarget != null) transform = source.CompositionTarget.TransformFromDevice;
+                // [修正 V5] 徹底解決三螢幕 + 混合 DPI 下的回彈問題。
+                // 邏輯單位在跨螢幕時不可靠，因此我們在「實體像素空間」進行邊界判定。
+                
+                // 1. 取得鍵盤相對於螢幕的「目前實體位置」
+                // 我們直接從 KeyboardContainer 獲取其在全域螢幕上的實體矩形
+                System.Windows.Point physStart = KeyboardContainer.PointToScreen(new System.Windows.Point(0, 0));
+                System.Windows.Point physEnd = KeyboardContainer.PointToScreen(new System.Windows.Point(KeyboardContainer.ActualWidth, KeyboardContainer.ActualHeight));
+                
+                double physX = physStart.X;
+                double physY = physStart.Y;
+                double physW = physEnd.X - physStart.X;
+                double physH = physEnd.Y - physStart.Y;
 
-                var topLeft = transform.Transform(new System.Windows.Point(wa.Left, wa.Top));
-                var bottomRight = transform.Transform(new System.Windows.Point(wa.Right, wa.Bottom));
-                double waLeft = topLeft.X;
-                double waTop = topLeft.Y;
-                double waWidth = Math.Max(0, bottomRight.X - topLeft.X);
-                double waHeight = Math.Max(0, bottomRight.Y - topLeft.Y);
+                double newPhysX = physX;
+                double newPhysY = physY;
 
-                double w = TargetWidth;
-                double h = TargetHeight;
+                // 2. 在物理空間進行 Clamp (對比 WorkingArea)
+                if (newPhysX < wa.Left) newPhysX = wa.Left;
+                if (newPhysX + physW > wa.Right) newPhysX = wa.Right - physW;
+                if (newPhysY < wa.Top) newPhysY = wa.Top;
+                if (newPhysY + physH > wa.Bottom) newPhysY = wa.Bottom - physH;
 
-                double newLeft = TargetLeft;
-                double newTop = TargetTop;
+                // 3. 如果物理位置有變，計算位移量並套用到邏輯座標
+                if (Math.Abs(newPhysX - physX) > 0.5 || Math.Abs(newPhysY - physY) > 0.5)
+                {
+                    // 取得目前的 DPI 縮放率來將物理位移轉回邏輯位移
+                    // 雖然這在跨螢幕時仍有微小誤差，但因為我們是「增量修正」，誤差會被抵消
+                    double dx = newPhysX - physX;
+                    double dy = newPhysY - physY;
 
-                if (newLeft < waLeft) newLeft = waLeft;
-                if (newLeft + w > waLeft + waWidth) newLeft = waLeft + waWidth - w;
-                if (newTop < waTop) newTop = waTop;
-                if (newTop + h > waTop + waHeight) newTop = waTop + waHeight - h;
+                    // 透過 PointFromScreen 獲取修正後的邏輯座標
+                    var targetPhysPos = new System.Windows.Point(newPhysX, newPhysY);
+                    var newLogicPosInsideWindow = this.PointFromScreen(targetPhysPos);
+                    
+                    // 更新 TargetLeft/Top
+                    TargetLeft = this.Left + newLogicPosInsideWindow.X;
+                    TargetTop = this.Top + newLogicPosInsideWindow.Y;
 
-                if (TargetLeft != newLeft) TargetLeft = newLeft;
-                if (TargetTop != newTop) TargetTop = newTop;
+                    // 同步物理引擎狀態，防止大幅震盪
+                    _lastWindowLeft = TargetLeft;
+                    _lastWindowTop = TargetTop;
+                    _accumulatedDeltaX = 0;
+                    _accumulatedDeltaY = 0;
+
+                    foreach (var row in KeyRows)
+                    {
+                        if (row == null) continue;
+                        foreach (var k in row) k?.RandomizePhysics();
+                    }
+                }
             }
             finally
             {
@@ -802,7 +870,10 @@ namespace OSK
                 GC.WaitForPendingFinalizers();
                 if (Environment.OSVersion.Platform == PlatformID.Win32NT)
                 {
-                    SetProcessWorkingSetSize(System.Diagnostics.Process.GetCurrentProcess().Handle, -1, -1);
+                    using (var proc = System.Diagnostics.Process.GetCurrentProcess())
+                    {
+                        SetProcessWorkingSetSize(proc.Handle, -1, -1);
+                    }
                 }
             }
             catch { }
@@ -810,10 +881,25 @@ namespace OSK
 
         private void SetupVirtualScreen()
         {
-            this.Left = SystemParameters.VirtualScreenLeft;
-            this.Top = SystemParameters.VirtualScreenTop;
-            this.Width = SystemParameters.VirtualScreenWidth;
-            this.Height = SystemParameters.VirtualScreenHeight;
+            // 使用 Win32 直接獲取虛擬螢幕邊界，排除 SystemParameters 的快取延遲與偏差
+            int physLeft = GetSystemMetrics(76); // SM_XVIRTUALSCREEN
+            int physTop = GetSystemMetrics(77);  // SM_YVIRTUALSCREEN
+            int physWidth = GetSystemMetrics(78); // SM_CXVIRTUALSCREEN
+            int physHeight = GetSystemMetrics(79); // SM_CYVIRTUALSCREEN
+
+            // 確保 MainWindow 覆蓋物理全景，無論熱插拔或解析度如何
+            var source = PresentationSource.FromVisual(this);
+            double dpiX = 96.0, dpiY = 96.0;
+            if (source?.CompositionTarget != null)
+            {
+                dpiX = 96.0 * source.CompositionTarget.TransformToDevice.M11;
+                dpiY = 96.0 * source.CompositionTarget.TransformToDevice.M22;
+            }
+
+            this.Left = physLeft * 96.0 / dpiX;
+            this.Top = physTop * 96.0 / dpiY;
+            this.Width = physWidth * 96.0 / dpiX;
+            this.Height = physHeight * 96.0 / dpiY;
         }
 
         private void MainWindow_Loaded(object? sender, RoutedEventArgs e)
@@ -852,14 +938,28 @@ namespace OSK
                 else _physShiftDownTime = DateTime.MinValue;
 
                 _lastPhysicalShiftDown = physShift;
-                _isCapsLockActive = (GetKeyState(0x14) & 0x0001) != 0;
-
                 bool isPhysShiftLongPressed = physShift && (DateTime.Now - _physShiftDownTime).TotalMilliseconds > 200;
-                _isShiftActive = isPhysShiftLongPressed || _virtualShiftToggle;
-                _isCtrlActive = physCtrl || _virtualCtrlToggle;
-                _isAltActive = physAlt || _virtualAltToggle;
-                _isWinActive = physWin || _virtualWinToggle;
-                _isNumLockActive = (GetKeyState(0x90) & 0x0001) != 0;
+                
+                bool newCapsLock = (GetKeyState(0x14) & 0x0001) != 0;
+                bool newNumLock = (GetKeyState(0x90) & 0x0001) != 0;
+                bool newShift = isPhysShiftLongPressed || _virtualShiftToggle;
+                bool newCtrl = physCtrl || _virtualCtrlToggle;
+                bool newAlt = physAlt || _virtualAltToggle;
+                bool newWin = physWin || _virtualWinToggle;
+
+                // [重要] 如果狀態發生變更，主動觸發 UpdateDisplay 以確保 UI 反饋即時
+                if (newCapsLock != _isCapsLockActive || newNumLock != _isNumLockActive || 
+                    newShift != _isShiftActive || newCtrl != _isCtrlActive || 
+                    newAlt != _isAltActive || newWin != _isWinActive)
+                {
+                    _isCapsLockActive = newCapsLock;
+                    _isNumLockActive = newNumLock;
+                    _isShiftActive = newShift;
+                    _isCtrlActive = newCtrl;
+                    _isAltActive = newAlt;
+                    _isWinActive = newWin;
+                    UpdateDisplay(); // 狀態改變，立即重繪
+                }
 
                 // --- 視窗隨動與物理演算邏輯 (包含安全性檢查) ---
                 double curLeft = TargetLeft;
@@ -884,8 +984,8 @@ namespace OSK
                 double deltaY = 0;
                 bool hasMoved = false;
 
-                // 只有累積到一定量才進行物理偏移，優化效能並防止動能瞬間消失
-                if (Math.Abs(_accumulatedDeltaX) > 0.0001 || Math.Abs(_accumulatedDeltaY) > 0.0001)
+                // 提高累積閾值至 0.1，進一步屏蔽 WPF 的座標更新微噪訊
+                if (Math.Abs(_accumulatedDeltaX) > 0.1 || Math.Abs(_accumulatedDeltaY) > 0.1)
                 {
                     deltaX = _accumulatedDeltaX;
                     deltaY = _accumulatedDeltaY;
@@ -932,6 +1032,7 @@ namespace OSK
                 }
 
                 // 物理演算
+                bool anyKeyMoving = hasMoved; // 如果視窗還在動，物理一定在動
                 foreach (var row in KeyRows)
                 {
                     if (row == null) continue;
@@ -966,11 +1067,19 @@ namespace OSK
                         offX += velX * timeFactor;
                         offY += velY * timeFactor;
 
-                        // 只要還在移動，就不要強制歸零，防止「越動越少」
+                        // 更加激進的歸零機制：提高到 0.5 像素，讓按鍵在肉眼難辨的微動階段就直接歸位
                         if (!hasMoved)
                         {
-                            if (Math.Abs(offX) < 0.001 && Math.Abs(velX) < 0.001) { offX = 0; velX = 0; }
-                            if (Math.Abs(offY) < 0.001 && Math.Abs(velY) < 0.001) { offY = 0; velY = 0; }
+                            if (Math.Abs(offX) < 0.5 && Math.Abs(velX) < 0.5) { offX = 0; velX = 0; }
+                            if (Math.Abs(offY) < 0.5 && Math.Abs(velY) < 0.5) { offY = 0; velY = 0; }
+                        }
+
+                        // 提高「忙碌」判定門檻到 1.0 像素。
+                        // 這意味著按鍵只要進入最後的細微回彈（小於 1 像素）即視為「靜止」，
+                        // 以便立即讓左上角資訊欄恢復，不再等待完全靜止。
+                        if (Math.Abs(offX) > 1.0 || Math.Abs(offY) > 1.0 || Math.Abs(velX) > 1.0 || Math.Abs(velY) > 1.0)
+                        {
+                            anyKeyMoving = true;
                         }
 
                         // 批量更新，減少 PropertyChanged 觸發次數，防止 WPF 綁定崩潰
@@ -991,6 +1100,27 @@ namespace OSK
                         }
                     }
                 }
+                _isPhysicsActive = anyKeyMoving;
+
+                // [視覺回饋] 當系統進入抑制狀態時，清空資訊欄方便觀察
+                bool currentBusy = IsBusySuppressing;
+                if (currentBusy)
+                {
+                    if (!string.IsNullOrEmpty(CurrentAppInfo))
+                    {
+                        CurrentAppInfo = "";
+                        _lastLoggedAppInfo = ""; // 重置日誌緩存以確保歸位後能重新觸發更新
+                    }
+                }
+                else if (_wasBusySuppressing)
+                {
+                    // [即時恢復] 當狀態從 Busy 轉為 Idle 的瞬間，立即主動觸發一次偵測，消除 300ms 延遲
+                    _lastLoggedAppInfo = ""; 
+                    _lastClipboardText = ""; // 強制重置剪貼簿快取，確保恢復後立即抓取最新內容
+                    _clipboardCheckCounter = 0;
+                    DetectImeStatus();
+                }
+                _wasBusySuppressing = currentBusy;
 
                 // 僅在狀態真正有變時才更新顯示 (優化效能，防止 UI 管道壅塞並消除字串記憶體配置)
                 int currentStateHash = 
@@ -1018,20 +1148,35 @@ namespace OSK
 
         private void DetectImeStatus()
         {
+            // [優化] 當鍵盤正在物理運動、任何形式的拖曳或縮放中，暫停實質偵測
+            if (IsBusySuppressing) return;
+
             IntPtr foregroundHwnd = GetForegroundWindow();
             if (foregroundHwnd == IntPtr.Zero) return;
 
             uint threadId = GetWindowThreadProcessId(foregroundHwnd, out uint pid);
             string processName = "Unknown";
-            try
+            
+            if (pid == _lastPid && _lastProcessName != null)
             {
-                var proc = System.Diagnostics.Process.GetProcessById((int)pid);
-                processName = proc.ProcessName;
+                processName = _lastProcessName;
             }
-            catch { }
+            else
+            {
+                try
+                {
+                    using (var proc = System.Diagnostics.Process.GetProcessById((int)pid))
+                    {
+                        processName = proc.ProcessName;
+                    }
+                    _lastPid = pid;
+                    _lastProcessName = processName;
+                }
+                catch { }
+            }
 
             GUITHREADINFO guiInfo = new GUITHREADINFO();
-            guiInfo.cbSize = Marshal.SizeOf(guiInfo);
+            guiInfo.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
 
             IntPtr targetHwnd = foregroundHwnd;
             if (GetGUIThreadInfo(threadId, ref guiInfo))
@@ -1140,10 +1285,21 @@ namespace OSK
             return "";
         }
 
+        private string GetClipboardTextSafelyThrottled()
+        {
+            _clipboardCheckCounter++;
+            if (_clipboardCheckCounter >= 10 || string.IsNullOrEmpty(_lastClipboardText))
+            {
+                _clipboardCheckCounter = 0;
+                _lastClipboardText = GetClipboardTextSafe();
+            }
+            return _lastClipboardText;
+        }
+
         private void UpdateAppInfo(string processName, bool isZhuyin)
         {
             string status = isZhuyin ? "注音" : "英文";
-            string clip = GetClipboardTextSafe();
+            string clip = GetClipboardTextSafelyThrottled();
             string newInfo = $"{processName} - {status}";
             if (!string.IsNullOrEmpty(clip))
             {
@@ -1153,10 +1309,8 @@ namespace OSK
             if (_lastLoggedAppInfo != newInfo)
             {
                 _lastLoggedAppInfo = newInfo;
-                if (System.Windows.Application.Current != null && System.Windows.Application.Current.Dispatcher != null)
-                {
-                    System.Windows.Application.Current.Dispatcher.InvokeAsync(() => { CurrentAppInfo = newInfo; });
-                }
+                // [優化] 直接設定屬性，避免 Dispatcher 造成的非同步微小延遲
+                CurrentAppInfo = newInfo;
             }
         }
 
@@ -1179,6 +1333,23 @@ namespace OSK
 
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
+            const int WM_DISPLAYCHANGE = 0x007E;
+            const int WM_DPICHANGED = 0x02E0;
+            const int WM_SETTINGCHANGE = 0x001A;
+
+            if (msg == WM_DISPLAYCHANGE || msg == WM_DPICHANGED)
+            {
+                // [修正] 雙重保險：監聽螢幕變更與 DPI 變更，即時更新虛擬畫布
+                SetupVirtualScreen();
+                ClampToScreen();
+                handled = true;
+            }
+
+            if (msg == WM_SETTINGCHANGE)
+            {
+                // [新功能] 當系統偏好設定（如深淺色模式）變更時，自動偵測並同步主題
+                DetectSystemTheme();
+            }
             if (msg == WM_NCHITTEST)
             {
                 if (_isTouchDraggingWindow)
@@ -1191,58 +1362,9 @@ namespace OSK
             if (msg == _msgShowOsk) { ToggleVisibility(); handled = true; }
             if (msg == WM_WINDOWPOSCHANGING)
             {
-                WINDOWPOS wp = Marshal.PtrToStructure<WINDOWPOS>(lParam);
-                if ((wp.flags & SWP_NOMOVE) == 0 || (wp.flags & SWP_NOSIZE) == 0)
-                {
-                    double dpiX = 96.0, dpiY = 96.0;
-                    var source = PresentationSource.FromVisual(this);
-                    if (source?.CompositionTarget != null)
-                    {
-                        Matrix m = source.CompositionTarget.TransformToDevice;
-                        dpiX = 96.0 * m.M11;
-                        dpiY = 96.0 * m.M22;
-                    }
-
-                    int w = (wp.flags & SWP_NOSIZE) == 0 ? wp.cx : (int)(this.ActualWidth * dpiX / 96.0);
-                    int h = (wp.flags & SWP_NOSIZE) == 0 ? wp.cy : (int)(this.ActualHeight * dpiY / 96.0);
-
-                    if (w <= 0) w = (int)(1000 * dpiX / 96.0);
-                    if (h <= 0) h = (int)(330 * dpiY / 96.0);
-
-                    int curX = (wp.flags & SWP_NOMOVE) == 0 ? wp.x : (int)(TargetLeft * dpiX / 96.0);
-                    int curY = (wp.flags & SWP_NOMOVE) == 0 ? wp.y : (int)(TargetTop * dpiY / 96.0);
-
-                    // Grab the monitor where this bounds rectangle would land
-                    RECT rect = new RECT { left = curX, top = curY, right = curX + w, bottom = curY + h };
-                    IntPtr hMonitor = MonitorFromRect(ref rect, MONITOR_DEFAULTTONEAREST);
-                    if (hMonitor != IntPtr.Zero)
-                    {
-                        MONITORINFOEX mInfo = new MONITORINFOEX();
-                        mInfo.cbSize = Marshal.SizeOf(mInfo);
-                        if (GetMonitorInfo(hMonitor, ref mInfo))
-                        {
-                            var wa = mInfo.rcWork;
-
-                            int newX = curX;
-                            int newY = curY;
-
-                            if (newX < wa.left) newX = wa.left;
-                            if (newX + w > wa.right) newX = wa.right - w;
-
-                            if (newY < wa.top) newY = wa.top;
-                            // Make sure we check against wa.top again if wa.bottom - wa.top is actually smaller than the window (edge case)
-                            if (newY + h > wa.bottom) newY = Math.Max(wa.top, wa.bottom - h);
-
-                            if (newX != wp.x || newY != wp.y)
-                            {
-                                wp.x = newX;
-                                wp.y = newY;
-                                Marshal.StructureToPtr(wp, lParam, true);
-                                handled = true;
-                            }
-                        }
-                    }
-                }
+                // [修正] 移除主視窗邊界限制邏輯。
+                // 此主視窗 (MainWindow) 作為透明底層，必須覆蓋整個虛擬桌面區域 (SystemParameters.VirtualScreen)。
+                // 若在此處將其限制在單一螢幕的 WorkingArea 內，鍵盤將無法跨越螢幕邊界，進而造成「三螢幕回彈」問題。
             }
             return IntPtr.Zero;
         }
@@ -1250,7 +1372,6 @@ namespace OSK
         // Win32 API for native Monitor matching
         [DllImport("user32.dll")] private static extern IntPtr MonitorFromRect([In] ref RECT lprc, uint dwFlags);
         [DllImport("user32.dll", CharSet = CharSet.Auto)] private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
-        private const uint MONITOR_DEFAULTTONEAREST = 2;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct RECT { public int left; public int top; public int right; public int bottom; }
@@ -1277,7 +1398,7 @@ namespace OSK
 
             uint threadId = GetWindowThreadProcessId(foregroundHwnd, out _);
             GUITHREADINFO guiInfo = new GUITHREADINFO();
-            guiInfo.cbSize = Marshal.SizeOf(guiInfo);
+            guiInfo.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
 
             IntPtr targetHwnd = foregroundHwnd;
             if (GetGUIThreadInfo(threadId, ref guiInfo))
@@ -1686,6 +1807,7 @@ namespace OSK
                 _isMouseDraggingWindow = false;
                 ClampToScreen();
                 Mouse.Capture(null);
+                SaveSettings(); // 拖曳結束後存檔
             }
 
             if (!IsEditMode) return;
@@ -1967,12 +2089,14 @@ namespace OSK
                             if (showNav && !string.IsNullOrEmpty(k.EnglishUpper))
                             {
                                 k.DisplayName = k.EnglishUpper;
-                                k.DynamicTextColor = _themeNumColor;
+                                // 導航模式 (NumLock OFF)：白字 (一般文字顏色)
+                                k.DynamicTextColor = _themeTextColor;
                             }
                             else
                             {
                                 k.DisplayName = k.English;
-                                k.DynamicTextColor = _themeTextColor;
+                                // 數字模式 (NumLock ON)：藍字 (與亮起的 Num 鍵同為主題色，解決使用者感受到的版面相反問題)
+                                k.DynamicTextColor = _themeNumColor;
                             }
                         }
                         else
@@ -1994,7 +2118,7 @@ namespace OSK
                     }
 
                     if (k.VkCode == 0x14) { k.TextColor = "Cyan"; k.IsActiveToggle = _isCapsLockActive; k.DisplayName = "⇪"; k.DynamicTextColor = _isCapsLockActive ? "Cyan" : _themeTextColor; }
-                    if (k.VkCode == 0x90) { k.TextColor = _themeNumColor; k.IsActiveToggle = !_isNumLockActive; k.DisplayName = "Num"; k.DynamicTextColor = !_isNumLockActive ? _themeNumColor : _themeTextColor; }
+                    if (k.VkCode == 0x90) { k.TextColor = _themeNumColor; k.IsActiveToggle = _isNumLockActive; k.DisplayName = "Num"; k.DynamicTextColor = _isNumLockActive ? _themeNumColor : _themeTextColor; }
                     if (k.VkCode == 0x10 || k.VkCode == 0xA0 || k.VkCode == 0xA1) { k.TextColor = _isDarkMode ? "#1E90FF" : "#0078D7"; k.IsActiveToggle = _isShiftActive; k.DisplayName = "⇧"; k.DynamicTextColor = _isShiftActive ? (_isDarkMode ? "#1E90FF" : "#0078D7") : _themeTextColor; }
                     if (k.VkCode == 0x11 || k.VkCode == 0xA2 || k.VkCode == 0xA3) { k.TextColor = "Cyan"; k.IsActiveToggle = _isCtrlActive; k.DisplayName = "⌃"; k.DynamicTextColor = _isCtrlActive ? "Cyan" : _themeTextColor; }
                     if (k.VkCode == 0x12 || k.VkCode == 0xA4 || k.VkCode == 0xA5) { k.TextColor = "Cyan"; k.IsActiveToggle = _isAltActive; k.DisplayName = "⌥"; k.DynamicTextColor = _isAltActive ? "Cyan" : _themeTextColor; }
@@ -2258,10 +2382,11 @@ namespace OSK
         private void LoadSettings()
         {
             bool hasSavedTheme = false;
-            if (!File.Exists(_iniFilePath)) return;
-
-            try
+            // [修正] 即使文件不存在，也應執行後續的主題偵測等邏輯
+            if (File.Exists(_iniFilePath))
             {
+                try
+                {
                 var lines = File.ReadAllLines(_iniFilePath);
                 foreach (var line in lines)
                 {
@@ -2328,6 +2453,7 @@ namespace OSK
                 ApplyCustomLayout();
             }
             catch { }
+            }
 
             if (!hasSavedTheme)
             {
@@ -2431,13 +2557,26 @@ namespace OSK
         {
             try
             {
+                double op = this.Opacity;
+                double w = TargetWidth;
+                double h = TargetHeight;
+                double left = TargetLeft;
+                double top = TargetTop;
+
+                // [修正] 寫入前檢查數值有效性，防止 NaN 或 Infinity 損壞設定檔
+                if (!double.IsFinite(op)) op = 1.0;
+                if (!double.IsFinite(w) || w < 100) w = 1000;
+                if (!double.IsFinite(h) || h < 50) h = 300;
+                if (!double.IsFinite(left)) left = 0;
+                if (!double.IsFinite(top)) top = 0;
+
                 var lines = new List<string>
                 {
-                    $"Opacity={this.Opacity}",
-                    $"Width={TargetWidth}",
-                    $"Height={TargetHeight}",
-                    $"Left={TargetLeft}",
-                    $"Top={TargetTop}",
+                    $"Opacity={op}",
+                    $"Width={w}",
+                    $"Height={h}",
+                    $"Left={left}",
+                    $"Top={top}",
                     $"IsFullLayout={this.IsFullLayout}",
                     $"IsDynamicLayout={this.IsDynamicLayout}",
                     $"IsPinned={_isPinned}",
@@ -2490,6 +2629,121 @@ namespace OSK
             if (result == MessageBoxResult.Yes)
             {
                 System.Windows.Application.Current.Shutdown();
+            }
+        }
+
+        private DispatcherTimer? _oskMonitorTimer = null;
+        private bool _savedPinnedStateBeforeSystemOsk = true;
+
+        private void CallSystemOsk_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                // [需求] 備份目前的釘選狀態，並強制設為固定 (Pinned)
+                _savedPinnedStateBeforeSystemOsk = _isPinned;
+                if (!_isPinned)
+                {
+                    _isPinned = true;
+                    OnPropertyChanged("PinIcon");
+                }
+
+                // 為了防止我們的 OSK 以 32 位元執行時，呼叫 OSK 遭到 WOW64 轉向導致失敗
+                // 我們強制指定使用 64 位元系統的原生資料夾 (sysnative)
+                string sysDir = Environment.Is64BitOperatingSystem && !Environment.Is64BitProcess
+                    ? Path.Combine(Environment.GetEnvironmentVariable("windir") ?? @"C:\Windows", "sysnative")
+                    : Environment.GetFolderPath(Environment.SpecialFolder.System);
+
+                string oskPath = Path.Combine(sysDir, "osk.exe");
+
+                // [重要] 在啟動系統小鍵盤前，必須先停止本體的 UIA 偵測器
+                // 防止兩套 UIA 掛鉤同時運作造成資源衝突、卡死或效能嚴重下降
+                _inputDetector?.Stop();
+
+                // [優化] 改用 cmd /c start 方式啟動，這在某些系統權限下比直接 Process.Start 更穩定
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/c start \"\" \"{oskPath}\"",
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                });
+
+                // 設定系統 OSK 啟用的全域旗標，這將會使得 IsBusySuppressing 成立，從而阻擋常駐偵測器干涉
+                _isSystemOskActive = true;
+
+                // 隱藏本體，避免畫面重疊
+                this.Hide();
+
+                int currentProcessId = Process.GetCurrentProcess().Id;
+                DateTime startTime = DateTime.Now;
+                bool didSystemOskStart = false; // 紀錄是否曾經偵測到系統鍵盤啟動
+
+                // 啟動監控，等待系統 osk.exe 關閉後再重新顯示本體
+                if (_oskMonitorTimer == null)
+                {
+                    _oskMonitorTimer = new DispatcherTimer();
+                    _oskMonitorTimer.Interval = TimeSpan.FromSeconds(1);
+                    _oskMonitorTimer.Tick += (s, args) =>
+                    {
+                        var procs = Process.GetProcessesByName("osk");
+                        
+                        // [雙重辨認] 1. 進程路徑比對 2. FindWindow 視窗類別比對 (解決權限導致無法讀取進程資訊的邊界案例)
+                        bool hasOskProcess = procs.Any(p => {
+                            try {
+                                string? path = p.MainModule?.FileName?.ToLower();
+                                if (string.IsNullOrEmpty(path)) return false;
+                                return (path.Contains(@"\windows\system32\") || path.Contains(@"\windows\sysnative\")) && p.Id != currentProcessId;
+                            } catch { 
+                                return p.Id != currentProcessId && p.ProcessName.Equals("osk", StringComparison.OrdinalIgnoreCase); 
+                            } 
+                        });
+
+                        // 系統 OSK 的視窗類別名稱固定為 OSKMainClass
+                        bool hasOskWindow = FindWindow("OSKMainClass", null) != IntPtr.Zero;
+
+                        bool isSystemOskRunning = hasOskProcess || hasOskWindow;
+
+                        if (isSystemOskRunning) didSystemOskStart = true;
+
+                        double elapsed = (DateTime.Now - startTime).TotalSeconds;
+                        bool initialBuffer = elapsed < 3;
+                        
+                        // [邏輯優化] 只有在「從未偵測到啟動」且「超過 15 秒」時才判定為真的啟動失敗
+                        // 一旦偵測到啟動 (didSystemOskStart = true)，則永遠等待直到它消失為止，不再受超時限制
+                        bool launchTimeout = !didSystemOskStart && elapsed > 15;
+
+                        if ((!isSystemOskRunning && !initialBuffer && didSystemOskStart) || launchTimeout)
+                        {
+                            _isSystemOskActive = false; // 取消抑制標記
+                            
+                            // [需求恢復] 恢復原本的釘選狀態
+                            _isPinned = _savedPinnedStateBeforeSystemOsk;
+                            OnPropertyChanged("PinIcon");
+
+                            // [恢復] 重新啟動偵測器 (僅在非釘選狀態下啟動)
+                            if (!_isPinned) _inputDetector?.Start();
+                            
+                            this.Show();
+                            _oskMonitorTimer?.Stop();
+                            _oskMonitorTimer = null;
+                            
+                            if (launchTimeout)
+                            {
+                                System.Windows.MessageBox.Show("內建鍵盤未能在預期時間內啟動，已恢復本體。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                            }
+                        }
+                    };
+                }
+                _oskMonitorTimer.Start();
+            }
+            catch (Exception ex)
+            {
+                _isSystemOskActive = false;
+                _isPinned = _savedPinnedStateBeforeSystemOsk;
+                OnPropertyChanged("PinIcon");
+                this.Show();
+                System.Windows.MessageBox.Show($"無法啟動內建虛擬鍵盤 [{ex.Message}]", "錯誤", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
@@ -2602,6 +2856,7 @@ namespace OSK
                 _isTouchDraggingWindow = false;
                 if (sender is UIElement el) el.ReleaseTouchCapture(e.TouchDevice);
                 ClampToScreen(); // 確保不會被拖出畫面外
+                SaveSettings();  // 拖曳結束後存檔
             }
         }
         private void Resize_Init(object sender, MouseButtonEventArgs e) { _isResizing = true; Mouse.Capture((UIElement)sender); }
@@ -2626,11 +2881,18 @@ namespace OSK
         {
             System.Windows.Media.CompositionTarget.Rendering -= VisualSyncTimer_Tick;
             _notifyIcon?.Dispose();
-            _inputDetector?.Stop();
+            
+            // [快速關閉] 傳入 true 以跳過容易掛死的 UIA 事件註銷，由 OS 統一回收
+            _inputDetector?.Stop(true); 
             _memoryTrimTimer?.Stop();
             _imeTimer?.Stop();
+            _oskMonitorTimer?.Stop();
+            
             if (!IsEditMode) SaveSettings();
             base.OnClosed(e);
+
+            // [最終補強] 徹底強制終止進程，不留任何背景殭屍執行緒，確保可立即重複啟動測試
+            Environment.Exit(0);
         }
 
         protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
@@ -2645,6 +2907,7 @@ namespace OSK
 
         public event PropertyChangedEventHandler? PropertyChanged;
         protected void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+        protected void OnPropertyChanged(PropertyChangedEventArgs args) => PropertyChanged?.Invoke(this, args);
 
         private void ShowSecurityMenu()
         {
@@ -2738,20 +3001,20 @@ namespace OSK
         public string FnText { get { return _fnText; } set { if (_fnText != value) { _fnText = value; OnPropertyChanged("FnText"); OnPropertyChanged("FnDisp"); } } }
 
         private string _displayName = "";
-        public string DisplayName { get { return _displayName; } set { if (_displayName != value) { _displayName = value; OnPropertyChanged("DisplayName"); } } }
+        public string DisplayName { get { return _displayName; } set { if (_displayName != value) { _displayName = value; OnPropertyChanged(_argsDisplayName); } } }
 
         private string _dynamicTextColor = "White";
-        public string DynamicTextColor { get { return _dynamicTextColor; } set { if (_dynamicTextColor != value) { _dynamicTextColor = value; OnPropertyChanged("DynamicTextColor"); } } }
+        public string DynamicTextColor { get { return _dynamicTextColor; } set { if (_dynamicTextColor != value) { _dynamicTextColor = value; OnPropertyChanged(_argsDynamicTextColor); } } }
 
         public byte VkCode { get; set; }
         private static readonly Random _rnd = new();
 
         // 動態隨動屬性
         private double _offsetX = 0;
-        public double OffsetX { get => _offsetX; set { if (_offsetX != value) { _offsetX = value; OnPropertyChanged(nameof(OffsetX)); } } }
+        public double OffsetX { get => _offsetX; set { if (Math.Abs(_offsetX - value) > 0.0001) { _offsetX = value; OnPropertyChanged(_argsOffsetX); } } }
 
         private double _offsetY = 0;
-        public double OffsetY { get => _offsetY; set { if (_offsetY != value) { _offsetY = value; OnPropertyChanged(nameof(OffsetY)); } } }
+        public double OffsetY { get => _offsetY; set { if (Math.Abs(_offsetY - value) > 0.0001) { _offsetY = value; OnPropertyChanged(_argsOffsetY); } } }
 
         public double VelocityX { get; set; } = 0;
         public double VelocityY { get; set; } = 0;
@@ -2893,10 +3156,10 @@ namespace OSK
         public string NumColor { get { return _numColor; } set { _numColor = value; OnPropertyChanged("NumColor"); OnPropertyChanged("ShiftColor"); } }
 
         private bool _isPressed = false;
-        public bool IsPressed { get { return _isPressed; } set { _isPressed = value; OnPropertyChanged("IsPressed"); OnPropertyChanged("Background"); } }
+        public bool IsPressed { get { return _isPressed; } set { if (_isPressed != value) { _isPressed = value; OnPropertyChanged(_argsIsPressed); OnPropertyChanged(_argsBackground); } } }
 
         private bool _isActiveToggle = false;
-        public bool IsActiveToggle { get { return _isActiveToggle; } set { _isActiveToggle = value; OnPropertyChanged("IsActiveToggle"); OnPropertyChanged("Background"); } }
+        public bool IsActiveToggle { get { return _isActiveToggle; } set { if (_isActiveToggle != value) { _isActiveToggle = value; OnPropertyChanged(_argsIsActiveToggle); OnPropertyChanged(_argsBackground); } } }
 
         private string _normalBackground = "#333333";
         private string _pressedBackground = "#666666";
@@ -2932,6 +3195,15 @@ namespace OSK
 
         public event PropertyChangedEventHandler? PropertyChanged;
         protected void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+        protected void OnPropertyChanged(PropertyChangedEventArgs args) => PropertyChanged?.Invoke(this, args);
+
+        private static readonly PropertyChangedEventArgs _argsOffsetX = new PropertyChangedEventArgs(nameof(OffsetX));
+        private static readonly PropertyChangedEventArgs _argsOffsetY = new PropertyChangedEventArgs(nameof(OffsetY));
+        private static readonly PropertyChangedEventArgs _argsIsPressed = new PropertyChangedEventArgs(nameof(IsPressed));
+        private static readonly PropertyChangedEventArgs _argsBackground = new PropertyChangedEventArgs(nameof(Background));
+        private static readonly PropertyChangedEventArgs _argsDisplayName = new PropertyChangedEventArgs(nameof(DisplayName));
+        private static readonly PropertyChangedEventArgs _argsDynamicTextColor = new PropertyChangedEventArgs(nameof(DynamicTextColor));
+        private static readonly PropertyChangedEventArgs _argsIsActiveToggle = new PropertyChangedEventArgs(nameof(IsActiveToggle));
     }
 
     public class RelayCommand<T> : ICommand

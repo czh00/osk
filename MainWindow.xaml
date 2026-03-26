@@ -18,14 +18,44 @@
         <shell:WindowChrome CaptionHeight="0" ResizeBorderThickness="0" CornerRadius="10" GlassFrameThickness="0" UseAeroCaptionButtons="False" />
     </shell:WindowChrome.WindowChrome>
     <Window.Resources>
+        <Style x:Key="ControlButtonStyle" TargetType="Button">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="border" Background="{TemplateBinding Background}" CornerRadius="10">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="border" Property="Opacity" Value="0.8"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="border" Property="Opacity" Value="0.6"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
     </Window.Resources>
     
     <!-- VirtualScreen Canvas allowing full unbounded movement -->
     <Canvas x:Name="VirtualCanvas" Background="{x:Null}">
         <Border x:Name="KeyboardContainer" CornerRadius="10" Background="{Binding WindowBackground}" ClipToBounds="False">
             <Grid x:Name="MainRootGrid" Background="Transparent" ClipToBounds="False">
-                <!-- 右下角 Resize Grip：綁定 ResizeGripColor -->
+                <!-- 右下角 Resize Grip：使用實體裁切路徑確保圓角不被遮擋 -->
             <Grid VerticalAlignment="Bottom" HorizontalAlignment="Right" Width="25" Height="25" Cursor="SizeNWSE" MouseLeftButtonDown="Resize_Init" MouseMove="Resize_Move" MouseLeftButtonUp="Resize_End" Panel.ZIndex="100" Background="Transparent" Visibility="{Binding ResizeGripVisibility}">
+                <Grid.Clip>
+                    <CombinedGeometry GeometryCombineMode="Exclude">
+                        <CombinedGeometry.Geometry1>
+                            <RectangleGeometry Rect="0,0,25,25"/>
+                        </CombinedGeometry.Geometry1>
+                        <CombinedGeometry.Geometry2>
+                            <!-- 扣掉右下角圓角以外的部分 -->
+                            <PathGeometry Figures="M 25,15 A 10,10 0 0 1 15,25 L 25,25 Z"/>
+                        </CombinedGeometry.Geometry2>
+                    </CombinedGeometry>
+                </Grid.Clip>
                 <Path Data="M0,25 L25,25 L25,0 Z" Fill="{Binding ResizeGripColor}"/>
                 <Path Data="M10,25 L25,10 M15,25 L25,15 M20,25 L25,20" Stroke="{Binding ResizeGripColor}" StrokeThickness="1"/>
             </Grid>
@@ -35,7 +65,7 @@
                 <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
             <!-- 頂部拖曳區 (限縮於此區域) -->
-            <Grid Grid.Row="0" Background="Transparent" MouseLeftButtonDown="Window_MouseLeftButtonDown" TouchDown="TopTitleBar_TouchDown" TouchMove="TopTitleBar_TouchMove" TouchUp="TopTitleBar_TouchUp">
+            <Grid Grid.Row="0" Background="Transparent" MinHeight="35" MouseLeftButtonDown="Window_MouseLeftButtonDown" TouchDown="TopTitleBar_TouchDown" TouchMove="TopTitleBar_TouchMove" TouchUp="TopTitleBar_TouchUp">
                 <Grid.LayoutTransform>
                     <ScaleTransform ScaleX="1.2" ScaleY="1.2"/>
                 </Grid.LayoutTransform>
@@ -48,6 +78,16 @@
                            Margin="10,5,0,0" 
                            IsHitTestVisible="False" />
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,0,5" Panel.ZIndex="50">
+                    <!-- 系統鍵盤備援按鈕 (突破 UIPI 專用) -->
+                    <Button Click="CallSystemOsk_Click" 
+                            Content="🆘"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            Foreground="{Binding UiTextColor}"
+                            FontSize="16"
+                            Margin="0,0,8,0"
+                            ToolTip="當遇到防毒或 Splashtop 設定等最高權限視窗無法打字時，點擊此按鈕呼叫微軟內建鍵盤代勞" />
+
                     <!-- 全鍵盤/精簡版面切換按鈕 -->
                     <Button Command="{Binding ToggleFullLayoutCommand}" 
                             Content="{Binding FullLayoutIcon}"
@@ -117,21 +157,37 @@
                     <!-- 設定按鈕 (版面編輯) -->
                     <Button Content=" ⚙ " Command="{Binding ToggleEditModeCommand}" Width="30" Height="25" Margin="0,0,2,0" 
                             Background="{Binding ControlBtnBackground}" 
+                            Style="{StaticResource ControlButtonStyle}"
                             Foreground="{Binding SettingsBtnColor}"
                             FontWeight="Bold" BorderThickness="0"
                             ToolTip="編輯按鈕位置"/>
                             
-                    <!-- 最小化按鈕：文字綁定 UiTextColor，背景綁定 ControlBtnBackground -->
+                    <!-- 最小化按鈕 -->
                     <Button Content=" 🗕 " Click="Minimize_Click" Width="30" Height="25" Margin="0,0,2,0" 
                             Background="{Binding ControlBtnBackground}" 
+                            Style="{StaticResource ControlButtonStyle}"
                             Foreground="{Binding UiTextColor}"
                             FontWeight="Bold" BorderThickness="0"/>
                     
-                    <!-- 關閉按鈕：維持紅色背景，文字固定白色，確保警示意味 -->
-                    <Button Content=" ✕ " Click="Exit_Click" Width="30" Height="25" Margin="2,0,0,0" 
-                            Background="#993333" 
-                            Foreground="White"
-                            BorderThickness="0"/>
+                    <!-- 關閉按鈕：右上角增加圓角裁切區 -->
+                    <Grid Width="30" Height="25">
+                        <Grid.Clip>
+                            <CombinedGeometry GeometryCombineMode="Exclude">
+                                <CombinedGeometry.Geometry1>
+                                    <RectangleGeometry Rect="0,0,30,25"/>
+                                </CombinedGeometry.Geometry1>
+                                <CombinedGeometry.Geometry2>
+                                    <!-- 扣掉右上角圓角以外的部分 -->
+                                    <PathGeometry Figures="M 20,0 A 10,10 0 0 1 30,10 L 30,0 Z"/>
+                                </CombinedGeometry.Geometry2>
+                            </CombinedGeometry>
+                        </Grid.Clip>
+                        <Button Content=" ✕ " Click="Exit_Click" Width="30" Height="25" Margin="0" 
+                                Background="#993333" 
+                                Style="{StaticResource ControlButtonStyle}"
+                                Foreground="White"
+                                BorderThickness="0"/>
+                    </Grid>
                 </StackPanel>
             </Grid>
             <Viewbox Grid.Row="1" Stretch="Fill" HorizontalAlignment="Stretch" VerticalAlignment="Stretch">
@@ -152,7 +208,7 @@
                                 </ItemsControl.ItemsPanel>
                                 <ItemsControl.ItemTemplate>
                                     <DataTemplate>
-                                        <Border BorderBrush="#33FFFFFF" BorderThickness="1" CornerRadius="6"
+                                        <Border BorderBrush="#33FFFFFF" BorderThickness="1" CornerRadius="10"
                                                 Background="{Binding Background}"
                                                 Width="{Binding Width}"
                                                 Height="{Binding Height}"
